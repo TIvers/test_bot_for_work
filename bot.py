@@ -781,12 +781,16 @@ async def show_prices(msg: Message, s, notice=""):
     categories = list(dict.fromkeys(field["category"] for field in fields))
     for category in categories:
         rows.append([InlineKeyboardButton(text=f"— {category.upper()} —", callback_data="adm:section")])
-        for field in (field for field in fields if field["category"] == category):
-            suffix = f" {config['currency']}" if field["kind"] == "amount" else ""
-            rows.append([InlineKeyboardButton(
-                text=f"{field['label'][:40]}: {price_display(field['value'])}{suffix}"[:64],
-                callback_data=f"adm:priceedit:{field['path']}",
-            )])
+        category_fields = [field for field in fields if field["category"] == category]
+        for index in range(0, len(category_fields), 2):
+            field_row = []
+            for field in category_fields[index:index + 2]:
+                suffix = f" {config['currency']}" if field["kind"] == "amount" else ""
+                field_row.append(InlineKeyboardButton(
+                    text=f"{field['label'][:40]}: {price_display(field['value'])}{suffix}"[:64],
+                    callback_data=f"adm:priceedit:{field['path']}",
+                ))
+            rows.append(field_row)
     rows.extend([
         [InlineKeyboardButton(text="↩️ Сбросить цены к стандартным", callback_data="adm:pricesreset")],
         [InlineKeyboardButton(text="🔧 К панели управления", callback_data="adm:home")],
