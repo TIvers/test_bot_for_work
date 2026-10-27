@@ -27,6 +27,7 @@ DATA = BASE / "data"
 DATA.mkdir(exist_ok=True)
 OVERRIDES_FILE, SETTINGS_FILE = DATA / "overrides.json", DATA / "settings.json"
 LEADS_FILE, PRICES_FILE = DATA / "leads.csv", BASE / "prices.json"
+DEFAULT_PRICES_FILE = BASE / "prices.default.json"
 
 log = logging.getLogger("bot")
 router = Router()
@@ -617,11 +618,11 @@ def admin_home():
         [InlineKeyboardButton(text="✖️ Закрыть", callback_data="adm:exit")]]))
 
 
-def load_prices():
+def load_prices(path=PRICES_FILE):
     try:
-        config = json.loads(PRICES_FILE.read_text("utf-8"))
+        config = json.loads(path.read_text("utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("Не удалось прочитать prices.json.") from exc
+        raise ValueError(f"Не удалось прочитать {path.name}.") from exc
     if not isinstance(config, dict):
         raise ValueError("Корень prices.json должен быть JSON-объектом.")
     if not isinstance(config.get("base"), dict):
@@ -653,30 +654,89 @@ def load_prices():
     return config
 
 
+def load_default_prices():
+    return load_prices(DEFAULT_PRICES_FILE)
+
+
 def price_fields(config):
     base_labels = {
-        "p": "Товары",
-        "s": "Услуги",
-        "m": "Товары и услуги",
-        "r": "Доработка сайта",
-        "n": "Другое",
+        "p": ("Товары", "Главное меню → Заказать новый сайт → Товары"),
+        "s": ("Услуги", "Главное меню → Заказать новый сайт → Услуги"),
+        "m": ("Товары и услуги", "Главное меню → Заказать новый сайт → Товары и услуги"),
+        "r": ("Доработка сайта", "Главное меню → Доработать текущий сайт"),
+        "n": ("Другое", "Главное меню → Заказать новый сайт → Что размещаем на сайте → Иное"),
     }
     fields = [
-        {"path": "currency", "label": "Валюта", "value": config["currency"], "kind": "text"},
-        {"path": "range:0", "label": "Нижний коэффициент", "value": config["range"][0], "kind": "ratio"},
-        {"path": "range:1", "label": "Верхний коэффициент", "value": config["range"][1], "kind": "ratio"},
+        {"path": "currency", "label": "Валюта", "value": config["currency"], "kind": "text",
+         "category": "Вилка", "description": "Валюта, отображаемая в итоговом диапазоне цены."},
+        {"path": "range:0", "label": "Нижняя граница", "value": config["range"][0], "kind": "ratio",
+         "category": "Вилка",
+         "description": "Множитель нижней границы: сумма расчёта умножается на значение. Итог округляется до 5 000."},
+        {"path": "range:1", "label": "Верхняя граница", "value": config["range"][1], "kind": "ratio",
+         "category": "Вилка",
+         "description": "Множитель верхней границы: сумма расчёта умножается на значение. Итог округляется до 5 000."},
     ]
     for code, value in config["base"].items():
-        label = base_labels.get(code, code)
-        fields.append({"path": f"base:{code}", "label": f"База · {label}",
-                       "value": value, "kind": "amount"})
+        label, location = base_labels.get(code, (code, "Основная ветка сценария"))
+        fields.append({"path": f"base:{code}", "label": label, "value": value, "kind": "amount",
+                       "category": "Базовые цены",
+                       "description": f"{location}. Стартовая сумма до применения дополнительных правил."})
     for index, rule in enumerate(config["rules"]):
         key = "per_item" if "per_item" in rule else "add"
-        detail = f"· {rule['answer']}" if "answer" in rule else "за пункт"
-        label = f"{rule['step']} {detail} ({'за каждый выбор' if key == 'per_item' else 'доплата'})"
-        fields.append({"path": f"rule:{index}:{key}", "label": label,
-                       "value": rule[key], "kind": "amount"})
+        contexts = price_rule_context(rule)
+        areas = list(dict.fromkeys(context["area"] for context in contexts))
+        category = areas[0] if len(areas) == 1 else "разные разделы"
+        detail = "каждый пункт" if key == "per_item" else rule["answer"]
+        question = contexts[0]["question"] if contexts else rule["step"]
+        fields.append({
+            "path": f"rule:{index}:{key}",
+            "label": f"{question} · {detail}",
+            "value": rule[key],
+            "kind": "amount",
+            "category": f"Доплаты · {category}",
+            "description": describe_price_rule(rule, contexts),
+        })
     return fields
+
+
+def price_rule_context(rule):
+    contexts = []
+    for sid, step in STEPS.items():
+        suffix = sid.split("_", 1)[1] if "_" in sid else sid
+        if not fnmatch(suffix, rule["step"]):
+            continue
+        options = [
+            option["label"] for option in step["options"]
+            if "answer" not in rule or rule["answer"].casefold() in option["label"].casefold()
+        ]
+        if options:
+            contexts.append({
+                "area": step["group"].replace("Заказ сайта · ", ""),
+                "question": step["title"],
+                "options": options,
+            })
+    return contexts
+
+
+def describe_price_rule(rule, contexts):
+    if not contexts:
+        return f"Правило сценария «{rule['step']}»."
+    lines = ["Путь в меню и подходящие ответы:"]
+    unique_contexts = []
+    seen = set()
+    for context in contexts:
+        entry = (context["area"], context["question"], tuple(context["options"]))
+        if entry not in seen:
+            seen.add(entry)
+            unique_contexts.append(context)
+    for context in unique_contexts:
+        options = ", ".join(f"«{option}»" for option in context["options"])
+        lines.append(f"• {context['area']} → {context['question']} → {options}")
+    if "per_item" in rule:
+        lines.append("Сумма добавляется за каждый выбранный вариант, кроме «Нет».")
+    else:
+        lines.append("Сумма добавляется один раз, если выбран указанный ответ.")
+    return "\n".join(lines)
 
 
 def price_display(value):
@@ -704,7 +764,7 @@ def set_price_value(config, path, value):
         raise ValueError("Выбранное поле цен больше не существует.")
 
 
-async def show_prices(msg: Message, s):
+async def show_prices(msg: Message, s, notice=""):
     try:
         config = load_prices()
         fields = price_fields(config)
@@ -714,16 +774,23 @@ async def show_prices(msg: Message, s):
             btn("🔧 К панели управления", "adm:home")]))
         return
 
-    text = "💰 Редактирование цен\n\nНажмите на значение, которое хотите изменить."
-    buttons = [
-        InlineKeyboardButton(
-            text=f"{field['label'][:42]}: {price_display(field['value'])}"[:64],
-            callback_data=f"adm:priceedit:{field['path']}",
-        )
-        for field in fields
-    ]
-    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    rows.append([InlineKeyboardButton(text="🔧 К панели управления", callback_data="adm:home")])
+    text = "💰 Редактирование цен\n\nНажмите нужную цену. Перед вводом бот покажет, где она применяется."
+    if notice:
+        text = f"{notice}\n\n{text}"
+    rows = []
+    categories = list(dict.fromkeys(field["category"] for field in fields))
+    for category in categories:
+        rows.append([InlineKeyboardButton(text=f"— {category.upper()} —", callback_data="adm:section")])
+        for field in (field for field in fields if field["category"] == category):
+            suffix = f" {config['currency']}" if field["kind"] == "amount" else ""
+            rows.append([InlineKeyboardButton(
+                text=f"{field['label'][:40]}: {price_display(field['value'])}{suffix}"[:64],
+                callback_data=f"adm:priceedit:{field['path']}",
+            )])
+    rows.extend([
+        [InlineKeyboardButton(text="↩️ Сбросить цены к стандартным", callback_data="adm:pricesreset")],
+        [InlineKeyboardButton(text="🔧 К панели управления", callback_data="adm:home")],
+    ])
     await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -1042,10 +1109,15 @@ async def cb_admin(cb: CallbackQuery):
             await show_prices(cb.message, s)
             return
         s["price_edit"] = {"path": arg}
-        prompt_text = ("Отправьте новое значение валюты." if field["kind"] == "text"
-                       else f"Отправьте новое значение для «{field['label']}».\n"
-                            + ("Допустима десятичная дробь, например 0.85." if field["kind"] == "ratio"
-                               else "Введите целое число без разделителей."))
+        prompt_text = (
+            f"💰 {field['label']}\n\n{field['description']}\n\n"
+            f"Текущее значение: {price_display(field['value'])}"
+            f"{' ' + config['currency'] if field['kind'] == 'amount' else ''}\n\n"
+            + ("Отправьте новое обозначение валюты (до 12 символов)." if field["kind"] == "text"
+               else "Отправьте положительный коэффициент, например 0.85 или 1.3."
+               if field["kind"] == "ratio"
+               else f"Отправьте целое неотрицательное число в {config['currency']}.")
+        )
         await send_menu_hint(cb.message, s, prompt_text, InlineKeyboardMarkup(inline_keyboard=[
             btn("Отмена", "adm:pricecancel")]))
         await cb.answer()
@@ -1055,6 +1127,35 @@ async def cb_admin(cb: CallbackQuery):
         await clear_menu_hint(cb.message, s)
         await show_prices(cb.message, s)
         await cb.answer()
+        return
+    elif act == "pricesreset":
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            btn("✅ Да, сбросить цены", "adm:pricesresetconfirm"),
+            btn("Отмена", "adm:prices"),
+        ])
+        await render(cb.message, s,
+                     "Сбросить все цены, коэффициенты и надбавки к значениям из prices.default.json?",
+                     markup)
+        await cb.answer()
+        return
+    elif act == "pricesresetconfirm":
+        try:
+            defaults = load_default_prices()
+            save_json(PRICES_FILE, defaults)
+        except ValueError as exc:
+            log.exception("Не удалось сбросить цены")
+            await render(cb.message, s, f"⚠️ {exc}", InlineKeyboardMarkup(inline_keyboard=[
+                btn("🔙 Назад к ценам", "adm:prices")]))
+            await cb.answer("Не удалось сбросить цены.", show_alert=True)
+            return
+        except OSError:
+            log.exception("Не удалось сохранить стандартные цены в prices.json")
+            await render(cb.message, s, "⚠️ Не удалось сохранить цены. Проверьте доступ к файлу.",
+                         InlineKeyboardMarkup(inline_keyboard=[btn("🔙 Назад к ценам", "adm:prices")]))
+            await cb.answer("Не удалось сохранить цены.", show_alert=True)
+            return
+        await show_prices(cb.message, s, "✅ Цены возвращены к стандартным значениям.")
+        await cb.answer("Цены сброшены.")
         return
     elif act == "resetall":
         text = "Сбросить все тексты и настройки пунктов меню к стандартному виду? Это действие нельзя отменить."
