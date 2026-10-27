@@ -7,15 +7,16 @@ import logging
 import os
 import re
 from datetime import datetime
+from io import BytesIO
 from fnmatch import fnmatch
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (BotCommand, BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery,
-                           InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Message,
-                           ReplyKeyboardRemove)
+from aiogram.types import (BufferedInputFile, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery,
+                           FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands,
+                           Message, ReplyKeyboardRemove)
 from dotenv import load_dotenv
 
 from scenario import BACK, GROUPS, STEPS
@@ -97,19 +98,82 @@ async def clear_kb(m: Message):
     await try_delete(carrier)
 
 
-def leads_text(limit=5):
+# ───────────────────────── Заявки: хранилище ─────────────────────────
+LEAD_COLS = ["ID", "Дата", "Имя", "Телефон", "Мессенджеры", "Время", "Telegram", "Ветка", "Оценка", "Ответы"]
+LEADS_PAGE = 5
+
+
+def write_leads(leads):
+    with LEADS_FILE.open("w", newline="", encoding="utf-8-sig") as f:   # utf-8-sig — чтобы Excel не ломал кириллицу
+        w = csv.writer(f, delimiter=";")
+        w.writerow(LEAD_COLS)
+        for l in leads:
+            w.writerow([l[c] for c in LEAD_COLS])
+
+
+def read_leads():
     try:
         with LEADS_FILE.open(encoding="utf-8-sig", newline="") as f:
-            rows = list(csv.reader(f, delimiter=";"))[1:]
+            rows = list(csv.reader(f, delimiter=";"))
     except FileNotFoundError:
-        rows = []
+        return []
     if not rows:
-        return "📋 Заявок пока нет."
-    out = [f"📋 Последние заявки (всего {len(rows)}):"]
-    for r in reversed(rows[-limit:]):
-        date, name, phone, _, when, tg, flow, est = (r + [""] * 8)[:8]
-        out.append(f"\n{date} · {name}\n📞 {phone} · {tg}\n📌 {flow}" + (f"\n💰 {est}" if est else ""))
+        return []
+    head, body = rows[0], rows[1:]
+    old_format = not head or head[0] != "ID"
+    if old_format:                                  # файл со старой версии бота: нумеруем по порядку
+        body = [[str(i)] + r for i, r in enumerate(body, 1)]
+    leads = [dict(zip(LEAD_COLS, (r + [""] * len(LEAD_COLS))[:len(LEAD_COLS)])) for r in body]
+    if old_format:
+        write_leads(leads)
+        settings["last_lead_id"] = max([int(l["ID"]) for l in leads] + [settings.get("last_lead_id", 0)])
+        save_json(SETTINGS_FILE, settings)
+    return leads
+
+
+def next_lead_id(leads):
+    """ID растёт всегда: номер удалённой заявки не выдаётся повторно."""
+    nid = max([int(l["ID"]) for l in leads if l["ID"].isdigit()] + [settings.get("last_lead_id", 0)]) + 1
+    settings["last_lead_id"] = nid
+    save_json(SETTINGS_FILE, settings)
+    return nid
+
+
+def lead_card(l):
+    out = [f"🆔 Заявка №{l['ID']} · {l['Дата']}", "", f"👤 {l['Имя']}", f"📞 {l['Телефон']}",
+           f"💬 Мессенджеры: {l['Мессенджеры'] or '—'}", f"🕐 Удобное время: {l['Время'] or '—'}",
+           f"✈️ Telegram: {l['Telegram']}", f"📌 Ветка: {l['Ветка']}"]
+    if l["Оценка"]:
+        out.append(f"💰 Вилка: {l['Оценка']}")
+    if l["Ответы"]:
+        out += ["", "Ответы клиента:"] + l["Ответы"].split(" | ")
     return "\n".join(out)[:3900]
+
+
+def build_xlsx(leads) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Заявки"
+    ws.append(LEAD_COLS)
+    for l in leads:
+        ws.append([int(l["ID"]) if l["ID"].isdigit() else l["ID"]]
+                  + [l[c] for c in LEAD_COLS[1:-1]] + [l["Ответы"].replace(" | ", "\n")])
+    for i, w in enumerate([6, 17, 20, 18, 22, 18, 18, 28, 22, 70]):
+        ws.column_dimensions[chr(65 + i)].width = w
+    wrap = Alignment(wrap_text=True, vertical="top")
+    for row in ws.iter_rows():
+        for c in row:
+            c.alignment = wrap
+            if isinstance(c.value, str):
+                c.data_type = "s"                   # текст клиента не должен выполняться как формула
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    ws.freeze_panes = "A2"
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # ───────────────────────── Сессии ─────────────────────────
@@ -169,6 +233,7 @@ async def show(msg: Message, s, sid, notice=""):
     text = step_text(step).replace("{name}", client_name(s))
     if notice:
         text = f"{notice}\n\n{text}"
+    s["ld_ask"] = False
     await render(msg, s, text, keyboard(step, s))
     await update_menu(msg.bot, msg.chat.id, s)
 
@@ -290,19 +355,17 @@ async def submit_lead(bot: Bot, s):
     tg = f"@{u['username']}" if u.get("username") else f"id {u['id']}"
     lines = summary_lines(ans)
 
-    card = (f"🔔 Новая заявка\n\n👤 {name}\n📞 {phone}\n💬 Мессенджеры: {messengers or '—'}\n"
+    leads = read_leads()
+    lead_id = next_lead_id(leads)
+    card = (f"🔔 Новая заявка №{lead_id}\n\n👤 {name}\n📞 {phone}\n💬 Мессенджеры: {messengers or '—'}\n"
             f"🕐 Удобное время: {when or '—'}\n✈️ Telegram: {tg}\n📌 Ветка: {flow}\n")
     if est:
         card += f"💰 Предварительная вилка: {est} (ориентир, не оферта)\n"
     card += "\nОтветы клиента:\n" + "\n".join(lines)
 
-    new_file = not LEADS_FILE.exists()
-    with LEADS_FILE.open("a", newline="", encoding="utf-8-sig") as f:   # utf-8-sig — чтобы Excel не ломал кириллицу
-        w = csv.writer(f, delimiter=";")
-        if new_file:
-            w.writerow(["Дата", "Имя", "Телефон", "Мессенджеры", "Время", "Telegram", "Ветка", "Оценка", "Ответы"])
-        w.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), name, phone, messengers, when, tg,
-                    flow, est or "", " | ".join(lines)])
+    leads.append(dict(zip(LEAD_COLS, [str(lead_id), datetime.now().strftime("%Y-%m-%d %H:%M"), name, phone,
+                                      messengers, when, tg, flow, est or "", " | ".join(lines)])))
+    write_leads(leads)
 
     chat = manager_chat()
     if not chat:
@@ -347,12 +410,14 @@ async def cmd_myid(m: Message):
 def admin_home():
     return ("🔧 Панель администратора", InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Тексты сообщений", callback_data="adm:groups")],
+        [InlineKeyboardButton(text="📋 Заявки", callback_data="ld:l:0")],
         [InlineKeyboardButton(text="📬 Куда приходят заявки", callback_data="adm:mgr")],
         [InlineKeyboardButton(text="✖️ Закрыть", callback_data="adm:exit")]]))
 
 
 async def open_admin(m: Message, s):
     s["ask"] = None
+    s["ld_ask"] = False
     text, markup = admin_home()
     await render(m, s, text, markup)        # панель открывается в том же единственном меню
 
@@ -394,7 +459,7 @@ async def cmd_leads(m: Message):
     await try_delete(m)
     s = sess(m.from_user)
     s["ask"] = None
-    await render(m, s, leads_text(), InlineKeyboardMarkup(inline_keyboard=[btn("✖️ Закрыть", "adm:exit")]))
+    await show_leads(m, s, 0)
 
 
 def btn(text, data):
@@ -461,6 +526,111 @@ async def cb_admin(cb: CallbackQuery):
         await cb.message.edit_text(text, reply_markup=markup)
     except TelegramBadRequest:
         pass
+    await cb.answer()
+
+
+# ───────────────────────── Меню заявок ─────────────────────────
+def leads_screen(page, notice=""):
+    leads = read_leads()[::-1]                      # свежие сверху
+    pages = max(1, -(-len(leads) // LEADS_PAGE))
+    page = min(max(page, 0), pages - 1)
+    if leads:
+        text = (f"📋 Заявки: всего {len(leads)}, стр. {page + 1}/{pages}\n"
+                "Нажмите на заявку, чтобы открыть подробности.")
+    else:
+        text = "📋 Заявок пока нет."
+    if notice:
+        text = f"{notice}\n\n{text}"
+    rows = [btn(f"№{l['ID']} · {l['Дата'][8:10]}.{l['Дата'][5:7]} · {l['Имя'][:16]} · {l['Ветка'][:22]}",
+                f"ld:v:{l['ID']}") for l in leads[page * LEADS_PAGE:(page + 1) * LEADS_PAGE]]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"ld:l:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"ld:l:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if leads:
+        rows += [btn("📥 Скачать все в Excel", "ld:xlsx"), btn("🗑 Удалить по ID", "ld:ask")]
+    rows.append(btn("✖️ Закрыть", "ld:close"))
+    return text, InlineKeyboardMarkup(inline_keyboard=rows), page
+
+
+async def show_leads(msg: Message, s, page=0, notice=""):
+    s.update(ld_ask=False, ask=None)
+    text, markup, s["ld_page"] = leads_screen(page, notice)
+    await render(msg, s, text, markup)
+
+
+async def confirm_delete(msg: Message, s, ids, notice=""):
+    s["ld_pending"] = ids
+    text = f"Удалить заявки {', '.join('№' + i for i in ids)}? Это нельзя отменить."
+    if notice:
+        text = f"{notice}\n\n{text}"
+    await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=[
+        btn("✅ Да, удалить", "ld:dok"), btn("Отмена", f"ld:l:{s.get('ld_page', 0)}")]))
+
+
+async def ask_lead_ids(msg: Message, s, notice=""):
+    s["ld_ask"] = True
+    text = ("Отправьте ID заявки одним сообщением (он в первой колонке Excel-файла и в карточке заявки).\n"
+            "Можно несколько: 3, 5, 8.")
+    if notice:
+        text = f"{notice}\n\n{text}"
+    await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=[btn("Отмена", f"ld:l:{s.get('ld_page', 0)}")]))
+
+
+@router.callback_query(F.data.startswith("ld:"))
+async def cb_leads(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not (is_admin(uid) or is_manager(uid)):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    s = sess(cb.from_user)
+    s["menu"] = cb.message.message_id
+    s["ld_ask"] = False
+    _, act, *rest = cb.data.split(":")
+    arg = rest[0] if rest else ""
+
+    if act == "close":
+        if s["stack"]:
+            await show(cb.message, s, s["stack"][-1])
+        else:
+            await go(cb.message, s, "main")
+    elif act == "l":
+        await show_leads(cb.message, s, int(arg))
+    elif act == "v":
+        lead = next((l for l in read_leads() if l["ID"] == arg), None)
+        if not lead:
+            await show_leads(cb.message, s, s.get("ld_page", 0), "⚠️ Заявка не найдена (возможно, уже удалена).")
+        else:
+            await render(cb.message, s, lead_card(lead), InlineKeyboardMarkup(inline_keyboard=[
+                btn("🗑 Удалить эту заявку", f"ld:del:{arg}"), btn("◀️ К списку", f"ld:l:{s.get('ld_page', 0)}")]))
+    elif act == "del":
+        await confirm_delete(cb.message, s, [arg])
+    elif act == "ask":
+        await ask_lead_ids(cb.message, s)
+    elif act == "dok":
+        ids = set(s.pop("ld_pending", []))
+        leads = read_leads()
+        keep = [l for l in leads if l["ID"] not in ids]
+        write_leads(keep)
+        await show_leads(cb.message, s, s.get("ld_page", 0), f"🗑 Удалено заявок: {len(leads) - len(keep)}.")
+    elif act == "xlsx":
+        leads = read_leads()
+        if not leads:
+            await cb.answer("Заявок пока нет", show_alert=True)
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        try:
+            doc = BufferedInputFile(build_xlsx(leads), filename=f"leads_{stamp}.xlsx")
+            await cb.message.answer_document(doc, caption=f"📥 Все заявки ({len(leads)} шт.)")
+        except ImportError:
+            await cb.message.answer_document(FSInputFile(LEADS_FILE, filename=f"leads_{stamp}.csv"),
+                                             caption="Библиотека openpyxl не установлена (pip install openpyxl), "
+                                                     "поэтому отправлен CSV — он тоже открывается в Excel.")
+        await cb.answer("Файл отправлен")
+        return
     await cb.answer()
 
 
@@ -588,6 +758,19 @@ async def on_message(m: Message):
         await try_delete(m)
         await render(m, s, "✅ Текст сохранён. Бот уже использует новый вариант.",
                      InlineKeyboardMarkup(inline_keyboard=[btn("🔧 К админ-панели", "adm:home")]))
+        return
+
+    if s.get("ld_ask") and m.text and (is_admin(m.from_user.id) or is_manager(m.from_user.id)):
+        await try_delete(m)                         # администратор вводит ID заявок для удаления
+        ids = list(dict.fromkeys(str(int(x)) for x in re.findall(r"\d+", m.text)))
+        have = {l["ID"] for l in read_leads()}
+        found, missing = [i for i in ids if i in have], [i for i in ids if i not in have]
+        note = f"⚠️ Не найдены ID: {', '.join(missing)}." if missing else ""
+        if found:
+            s["ld_ask"] = False
+            await confirm_delete(m, s, found, note)
+        else:
+            await ask_lead_ids(m, s, note or "⚠️ Не нашёл в сообщении ни одного ID.")
         return
 
     if not s["stack"]:
