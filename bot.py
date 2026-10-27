@@ -60,12 +60,27 @@ def privacy_confirmed(uid):
     return isinstance(accepted, list) and str(uid) in {str(value) for value in accepted}
 
 
-def is_admin(uid):
-    ids = {x for x in re.split(r"[,\s]+", os.getenv("ADMIN_IDS", "")) if x}
-    stored = settings.get("admin_ids", [])
+def role_ids(role):
+    env_key = "ADMIN_IDS" if role == "admin" else "MANAGER_IDS"
+    setting_key = "admin_ids" if role == "admin" else "manager_ids"
+    removed_key = f"removed_{setting_key}"
+    ids = {str(int(x)) for x in re.split(r"[,\s]+", os.getenv(env_key, ""))
+           if x.isdigit() and int(x) > 0}
+    stored = settings.get(setting_key, [])
     if isinstance(stored, list):
-        ids.update(str(x) for x in stored)
-    return str(uid) in ids
+        ids.update(str(int(x)) for x in stored if str(x).isdigit() and int(x) > 0)
+    if role == "manager":
+        chat_id = manager_chat()
+        if chat_id is not None and str(chat_id).isdigit() and int(chat_id) > 0:
+            ids.add(str(int(chat_id)))
+    removed = settings.get(removed_key, [])
+    if isinstance(removed, list):
+        ids.difference_update(str(int(x)) for x in removed if str(x).isdigit() and int(x) > 0)
+    return ids
+
+
+def is_admin(uid):
+    return str(uid) in role_ids("admin")
 
 
 def manager_chat():
@@ -74,12 +89,42 @@ def manager_chat():
 
 def is_manager(uid):
     """Менеджер: тот, чей личный чат указан для заявок, либо ID из MANAGER_IDS в .env."""
-    ids = {x for x in re.split(r"[,\s]+", os.getenv("MANAGER_IDS", "")) if x}
-    stored = settings.get("manager_ids", [])
-    if isinstance(stored, list):
-        ids.update(str(x) for x in stored)
-    mc = manager_chat()
-    return str(uid) in ids or (mc is not None and str(mc) == str(uid))
+    return str(uid) in role_ids("manager")
+
+
+def update_role_ids(role, add=(), remove=()):
+    setting_key = "admin_ids" if role == "admin" else "manager_ids"
+    removed_key = f"removed_{setting_key}"
+    stored = settings.get(setting_key, [])
+    stored = list(dict.fromkeys(str(int(value)) for value in stored
+                                if str(value).isdigit() and int(value) > 0)) if isinstance(stored, list) else []
+    excluded = settings.get(removed_key, [])
+    excluded = {str(int(value)) for value in excluded if str(value).isdigit() and int(value) > 0} \
+        if isinstance(excluded, list) else set()
+
+    for user_id in remove:
+        user_id = str(user_id)
+        if user_id in stored:
+            stored.remove(user_id)
+        env_key = "ADMIN_IDS" if role == "admin" else "MANAGER_IDS"
+        env_ids = {str(int(value)) for value in re.split(r"[,\s]+", os.getenv(env_key, ""))
+                   if value.isdigit() and int(value) > 0}
+        manager_id = manager_chat()
+        if (role == "manager" and manager_id is not None and str(manager_id).isdigit()
+                and int(manager_id) > 0 and str(int(manager_id)) == user_id):
+            env_ids.add(user_id)
+        if user_id in env_ids:
+            excluded.add(user_id)
+
+    for user_id in add:
+        user_id = str(user_id)
+        if user_id not in stored:
+            stored.append(user_id)
+        excluded.discard(user_id)
+
+    settings[setting_key] = stored
+    settings[removed_key] = sorted(excluded)
+    save_json(SETTINGS_FILE, settings)
 
 
 # ───────────────────────── Меню бота (кнопка «Меню» рядом с полем ввода) ─────────────────────────
@@ -125,9 +170,16 @@ async def delete_keyboard_carrier(bot: Bot, chat_id, message_id):
 
 
 async def remove_menu_editor_keyboard(msg: Message, s):
-    if not s.pop("editor_keyboard_message", None):
+    keyboard_message_id = s.pop("editor_keyboard_message", None)
+    s.pop("editor_keyboard_chat_id", None)
+    s.pop("editor_keyboard_signature", None)
+    if not keyboard_message_id:
         return
     await clear_kb(msg)
+    try:
+        await msg.bot.delete_message(msg.chat.id, keyboard_message_id)
+    except TelegramBadRequest:
+        log.debug("Не удалось удалить сообщение управления редактором")
 
 
 # ───────────────────────── Заявки: хранилище ─────────────────────────
@@ -394,7 +446,21 @@ async def clear_menu_hint(msg: Message, s):
 
 
 async def send_menu_hint(msg: Message, s, text, markup=None):
-    await clear_menu_hint(msg, s)
+    hint_id = s.get("menu_hint") if s.get("menu_hint_chat_id") == msg.chat.id else None
+    if hint_id:
+        try:
+            await msg.bot.edit_message_text(
+                text,
+                chat_id=msg.chat.id,
+                message_id=hint_id,
+                reply_markup=markup,
+            )
+            return
+        except TelegramBadRequest as exc:
+            if "not modified" in str(exc):
+                return
+            s.pop("menu_hint", None)
+            s.pop("menu_hint_chat_id", None)
     hint = await msg.bot.send_message(msg.chat.id, text, reply_markup=markup)
     s["menu_hint"] = hint.message_id
     s["menu_hint_chat_id"] = msg.chat.id
@@ -612,10 +678,30 @@ def admin_home():
         [InlineKeyboardButton(text="↩️ Сбросить все меню и выборы", callback_data="adm:resetall")],
         [InlineKeyboardButton(text="📋 Заявки", callback_data="ld:l:0")],
         [InlineKeyboardButton(text="📬 Куда приходят заявки", callback_data="adm:mgr")],
-        [InlineKeyboardButton(text="➕ Добавить администратора", callback_data="adm:addadmin")],
-        [InlineKeyboardButton(text="➕ Добавить менеджера", callback_data="adm:addmanager")],
+        [InlineKeyboardButton(text="👥 Изменить администраторов", callback_data="adm:roles:admin")],
+        [InlineKeyboardButton(text="👥 Изменить менеджеров", callback_data="adm:roles:manager")],
         [InlineKeyboardButton(text="🔄 Перезагрузить бота", callback_data="adm:restart")],
         [InlineKeyboardButton(text="✖️ Закрыть", callback_data="adm:exit")]]))
+
+
+def roles_screen(role, current_user_id=None):
+    role_name = "администраторов" if role == "admin" else "менеджеров"
+    ids = sorted(role_ids(role), key=lambda value: (not value.isdigit(), int(value) if value.isdigit() else value))
+    text = f"👥 Управление {role_name}\n\n"
+    text += "\n".join(f"• {user_id}" for user_id in ids) if ids else "Список пока пуст."
+    text += "\n\nВыберите участника, чтобы изменить его ID или удалить."
+    if role == "admin":
+        text += "\nСобственный ID нельзя удалить или заменить."
+    rows = []
+    for user_id in ids:
+        if role == "admin" and user_id == str(current_user_id):
+            rows.append([InlineKeyboardButton(text=f"🛡 {user_id} · вы", callback_data="adm:section")])
+        else:
+            rows.append([InlineKeyboardButton(text=f"✏️ {user_id}", callback_data=f"adm:roleedit:{role}:{user_id}"),
+                         InlineKeyboardButton(text="🗑", callback_data=f"adm:roledel:{role}:{user_id}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"adm:roleadd:{role}")])
+    rows.append([InlineKeyboardButton(text="◀️ К панели управления", callback_data="adm:home")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def load_prices(path=PRICES_FILE):
@@ -810,6 +896,27 @@ async def open_admin(m: Message, s):
     await render(m, s, text, markup)        # панель открывается в том же единственном меню
 
 
+async def remove_current_menu(msg: Message, s):
+    menu_id = s.get("menu")
+    if not menu_id or s.get("menu_chat_id") != msg.chat.id:
+        return
+    try:
+        await msg.bot.delete_message(msg.chat.id, menu_id)
+    except TelegramBadRequest:
+        log.debug("Не удалось удалить предыдущее сообщение меню")
+    s.pop("menu", None)
+    s.pop("menu_chat_id", None)
+    chat_key = str(msg.chat.id)
+    tracked = s.get("chat_messages", {}).get(chat_key, [])
+    if menu_id in tracked:
+        tracked.remove(menu_id)
+    cleanup = settings.get("chat_cleanup", {})
+    ids = cleanup.get(chat_key, []) if isinstance(cleanup, dict) else []
+    if menu_id in ids:
+        ids.remove(menu_id)
+        save_json(SETTINGS_FILE, settings)
+
+
 async def show_menu_editor(msg: Message, s, notice=""):
     editor = s.get("menu_edit")
     if not editor:
@@ -819,47 +926,116 @@ async def show_menu_editor(msg: Message, s, notice=""):
     step = STEPS[sid]
     text = step_text(step).replace("{name}", client_name(s))
     if notice:
-        await send_menu_hint(msg, s, notice)
-    text = f"🛠 Редактор меню · {step['title']}\n\n{text}"
+        await clear_menu_hint(msg, s)
 
     rows = []
-    for option in effective_options(step, include_hidden=True):
+    options = effective_options(step, include_hidden=True)
+    if editor.get("action") == "open":
+        options = [option for option in options
+                   if not option["_hidden"] and menu_option_opens_submenu(step, option, s)]
+    elif editor.get("action") == "delete":
+        options = [option for option in options if not menu_option_cannot_be_deleted(step, option, s)]
+    for option in options:
         label = f"🙈 {option['label']}" if option["_hidden"] else option["label"]
         rows.append(btn(label[:60], f"adm:menuitem:{option['_menu_key']}"))
-    await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=rows))
     await show_menu_editor_keyboard(msg, s, step)
+    await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    if notice:
+        await send_menu_hint(msg, s, notice)
+    else:
+        await send_menu_hint(msg, s, "Выберите в нижней панели функцию для редактирования меню ⬇️")
+
+
+def menu_option_target(step, option, s):
+    return next_of(step, option, s)
+
+
+def menu_option_opens_submenu(step, option, s):
+    return menu_option_target(step, option, s) in STEPS
+
+
+def menu_option_cannot_be_deleted(step, option, s):
+    target = menu_option_target(step, option, s)
+    return target in STEPS and (
+        option.get("next") in STEPS
+        or not option.get("rec", True)
+        or not step.get("record", True)
+        or not STEPS[target].get("record", True)
+    )
+
+
+def menu_editor_keyboard_rows(editor, step, s):
+    options = effective_options(step, include_hidden=True)
+    visible_options = [option for option in options if not option["_hidden"]]
+    rows = []
+
+    def add_pair(left, right=None):
+        rows.append([KeyboardButton(text=left)] +
+                    ([KeyboardButton(text=right)] if right else []))
+
+    if any(menu_option_opens_submenu(step, option, s) for option in visible_options):
+        add_pair("🧭 Открыть подменю", "💬 Текст вопроса")
+    else:
+        add_pair("💬 Текст вопроса")
+    if options:
+        add_pair("✏️ Изменить пункт", "👁 Скрыть / показать")
+    deletable = [option for option in options if not menu_option_cannot_be_deleted(step, option, s)]
+    if deletable:
+        add_pair("🗑 Удалить пункт", "➕ Добавить пункт" if allows_added_choices(step) else None)
+    elif allows_added_choices(step):
+        add_pair("➕ Добавить пункт")
+
+    next_step = step.get("next")
+    if isinstance(next_step, str) and next_step in STEPS:
+        add_pair("➡️ Следующий вопрос")
+
+    config = menu_choice_config(step)
+    if overrides.get(step["id"]) or any(config.get(key) for key in ("hidden", "deleted", "labels", "added")):
+        add_pair("↩️ Вернуть меню к стандартному виду")
+
+    can_go_back = len(editor["stack"]) > 1
+    can_go_home = editor["stack"] != ["main"]
+    if can_go_back or can_go_home:
+        add_pair("◀️ Предыдущий пункт" if can_go_back else "🏠 В начало",
+                 "🏠 В начало" if can_go_back and can_go_home else None)
+    add_pair("🔧 К панели управления")
+    return rows
 
 
 async def show_menu_editor_keyboard(msg: Message, s, step):
-    rows = [
-        [KeyboardButton(text="🧭 Открыть подменю"), KeyboardButton(text="💬 Текст вопроса")],
-        [KeyboardButton(text="✏️ Изменить пункт"), KeyboardButton(text="👁 Скрыть / показать")],
-    ]
-    if allows_added_choices(step):
-        rows.append([KeyboardButton(text="🗑 Удалить пункт"), KeyboardButton(text="➕ Добавить пункт")])
-    else:
-        rows.append([KeyboardButton(text="🗑 Удалить пункт")])
-    next_step = step.get("next")
-    if isinstance(next_step, str) and next_step in STEPS:
-        rows.append([KeyboardButton(text="➡️ Следующий вопрос")])
-    rows.extend([
-        [KeyboardButton(text="↩️ Вернуть меню к стандартному виду")],
-        [KeyboardButton(text="◀️ Предыдущий пункт"), KeyboardButton(text="🏠 В начало")],
-        [KeyboardButton(text="🔧 К панели управления")],
-    ])
+    editor = s["menu_edit"]
+    rows = menu_editor_keyboard_rows(editor, step, s)
+    signature = tuple(tuple(button.text for button in row) for row in rows)
+    if (s.get("editor_keyboard_message")
+            and s.get("editor_keyboard_chat_id") == msg.chat.id
+            and s.get("editor_keyboard_signature") == signature):
+        return
+
+    await remove_current_menu(msg, s)
     old_message_id = s.get("editor_keyboard_message")
     keyboard_message = await msg.bot.send_message(
         msg.chat.id,
-        "\u2063",
+        "🛠 Редактор меню",
         reply_markup=ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True),
     )
     s["editor_keyboard_message"] = keyboard_message.message_id
-    asyncio.create_task(delete_keyboard_carrier(msg.bot, msg.chat.id, keyboard_message.message_id))
+    s["editor_keyboard_chat_id"] = msg.chat.id
+    s["editor_keyboard_signature"] = signature
+    track_chat_message(s, keyboard_message.message_id, msg.chat.id)
     if old_message_id:
         try:
             await msg.bot.delete_message(msg.chat.id, old_message_id)
         except TelegramBadRequest:
             log.debug("Не удалось удалить предыдущее сообщение управления редактором")
+        chat_key = str(msg.chat.id)
+        tracked = s.get("chat_messages", {}).get(chat_key, [])
+        if old_message_id in tracked:
+            tracked.remove(old_message_id)
+        cleanup = settings.get("chat_cleanup", {})
+        ids = cleanup.get(chat_key, []) if isinstance(cleanup, dict) else []
+        if old_message_id in ids:
+            ids.remove(old_message_id)
+            save_json(SETTINGS_FILE, settings)
 
 
 async def handle_menu_editor_keyboard(m: Message, s, action):
@@ -900,6 +1076,8 @@ async def handle_menu_editor_keyboard(m: Message, s, action):
             editor["action"] = "open"
             editor.pop("pending", None)
             await show_menu_editor(m, s)
+        else:
+            await send_menu_hint(m, s, "У этого вопроса нет следующего шага.")
         return
     if action == "menuprev":
         editor.pop("pending", None)
@@ -980,6 +1158,11 @@ async def cmd_setmanager(m: Message):
     if not is_admin(m.from_user.id):
         return
     settings["manager_chat"] = m.chat.id
+    removed_managers = settings.get("removed_manager_ids", [])
+    if isinstance(removed_managers, list):
+        settings["removed_manager_ids"] = [
+            user_id for user_id in removed_managers if str(user_id) != str(m.chat.id)
+        ]
     save_json(SETTINGS_FILE, settings)
     await answer_temp(m, "✅ Готово. Новые заявки будут приходить в этот чат.")
     await update_menu(m.bot, m.chat.id, sess(m.from_user), force=True)   # в меню появится «Последние заявки»
@@ -1044,6 +1227,7 @@ async def cb_admin(cb: CallbackQuery):
         s["ld_ask"] = False
         s["menu_edit"] = {"stack": ["main"], "action": "open"}
         await clear_menu_hint(cb.message, s)
+        await remove_current_menu(cb.message, s)
         await show_menu_editor(cb.message, s)
         await cb.answer()
         return
@@ -1122,7 +1306,7 @@ async def cb_admin(cb: CallbackQuery):
                if field["kind"] == "ratio"
                else f"Отправьте целое неотрицательное число в {config['currency']}.")
         )
-        await send_menu_hint(cb.message, s, prompt_text, InlineKeyboardMarkup(inline_keyboard=[
+        await render(cb.message, s, prompt_text, InlineKeyboardMarkup(inline_keyboard=[
             btn("Отмена", "adm:pricecancel")]))
         await cb.answer()
         return
@@ -1309,16 +1493,7 @@ async def cb_admin(cb: CallbackQuery):
             await cb.answer(notice)
             return
         elif action == "delete":
-            target = option.get("next") or step.get("next")
-            has_submenu = (
-                option.get("next") in STEPS
-                or target in STEPS and (
-                    not option.get("rec", True)
-                    or not step.get("record", True)
-                    or not STEPS[target].get("record", True)
-                )
-            )
-            if has_submenu:
+            if menu_option_cannot_be_deleted(step, option, s):
                 editor["action"] = "open"
                 await show_menu_editor(cb.message, s,
                                        "Этот пункт ведёт в подменю, поэтому его можно только скрыть.")
@@ -1407,13 +1582,51 @@ async def cb_admin(cb: CallbackQuery):
                 "(личный, группа), напишите команду /setmanager в нужном чате.\n"
                 "Все заявки также сохраняются в файл data/leads.csv (открывается в Excel).")
         markup = InlineKeyboardMarkup(inline_keyboard=[btn(BACK, "adm:home")])
-    elif act in ("addadmin", "addmanager"):
-        role = "admin" if act == "addadmin" else "manager"
-        s["role_add"] = role
+    elif act == "roles":
+        if arg not in ("admin", "manager"):
+            await cb.answer("Неизвестный тип роли.", show_alert=True)
+            return
+        text, markup = roles_screen(arg, cb.from_user.id)
+    elif act == "roleadd":
+        if arg not in ("admin", "manager"):
+            await cb.answer("Неизвестный тип роли.", show_alert=True)
+            return
+        role = arg
+        s["role_add"] = {"role": role, "operation": "add"}
         role_name = "администраторов" if role == "admin" else "менеджеров"
         text = (f"Отправьте Telegram ID {role_name} одним сообщением.\n"
                 "Можно указать несколько ID через запятую или пробел. Узнать ID можно командой /myid.")
-        markup = InlineKeyboardMarkup(inline_keyboard=[btn("Отмена", "adm:home")])
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            btn("◀️ К списку", f"adm:roles:{role}"), btn("Отмена", "adm:home")])
+    elif act in ("roleedit", "roledel"):
+        parts = arg.split(":", 1)
+        if len(parts) != 2 or parts[0] not in ("admin", "manager") or not parts[1].isdigit():
+            await cb.answer("Некорректный участник списка.", show_alert=True)
+            return
+        role, user_id = parts
+        if user_id not in role_ids(role):
+            await cb.answer("Этот участник уже отсутствует в списке.", show_alert=True)
+            return
+        if act == "roledel":
+            if role == "admin" and user_id == str(cb.from_user.id):
+                await cb.answer("Нельзя удалить самого себя из администраторов.", show_alert=True)
+                return
+            update_role_ids(role, remove=[user_id])
+            role_name = "администраторов" if role == "admin" else "менеджеров"
+            await cb.message.edit_text(
+                f"✅ ID {user_id} удалён из списка {role_name}.\n🔄 Перезагружаю бота…",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[btn("🔧 К панели управления", "adm:home")]))
+            await cb.answer()
+            await request_restart(cb.from_user.id)
+            return
+        if role == "admin" and user_id == str(cb.from_user.id):
+            await cb.answer("Нельзя заменить собственный ID администратора.", show_alert=True)
+            return
+        s["role_add"] = {"role": role, "operation": "edit", "old_id": user_id}
+        role_name = "администратора" if role == "admin" else "менеджера"
+        text = f"Отправьте новый Telegram ID для {role_name} вместо {user_id}."
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            btn("◀️ К списку", f"adm:roles:{role}"), btn("Отмена", "adm:home")])
     elif act == "restart":
         await cb.message.edit_text("🔄 Перезагружаю бота…")
         await cb.answer()
@@ -1695,7 +1908,7 @@ async def on_message(m: Message):
     if price_edit and is_admin(m.from_user.id):
         if not m.text or not m.text.strip():
             await try_delete(m)
-            await send_menu_hint(m, s, "Отправьте новое значение текстом.", InlineKeyboardMarkup(
+            await render(m, s, "Отправьте новое значение текстом.", InlineKeyboardMarkup(
                 inline_keyboard=[btn("Отмена", "adm:pricecancel")]))
             return
         try:
@@ -1728,14 +1941,14 @@ async def on_message(m: Message):
             save_json(PRICES_FILE, config)
         except ValueError as exc:
             await try_delete(m)
-            await send_menu_hint(m, s, f"⚠️ {exc}\nПопробуйте ещё раз.", InlineKeyboardMarkup(
+            await render(m, s, f"⚠️ {exc}\nПопробуйте ещё раз.", InlineKeyboardMarkup(
                 inline_keyboard=[btn("Отмена", "adm:pricecancel")]))
             return
         except OSError:
             log.exception("Не удалось сохранить prices.json")
             await try_delete(m)
-            await send_menu_hint(m, s, "⚠️ Не удалось сохранить prices.json. Проверьте доступ к файлу.",
-                                 InlineKeyboardMarkup(inline_keyboard=[btn("Отмена", "adm:pricecancel")]))
+            await render(m, s, "⚠️ Не удалось сохранить prices.json. Проверьте доступ к файлу.",
+                         InlineKeyboardMarkup(inline_keyboard=[btn("Отмена", "adm:pricecancel")]))
             return
         s["price_edit"] = None
         await try_delete(m)
@@ -1810,39 +2023,60 @@ async def on_message(m: Message):
         return
 
     if s.get("role_add") and is_admin(m.from_user.id):
-        role = s["role_add"]
+        operation = s["role_add"]
+        role = operation["role"]
         if not m.text:
             await render(m, s, "Отправьте Telegram ID текстом.",
-                         InlineKeyboardMarkup(inline_keyboard=[btn("Отмена", "adm:home")]))
+                         InlineKeyboardMarkup(inline_keyboard=[
+                             btn("◀️ К списку", f"adm:roles:{role}"), btn("Отмена", "adm:home")]))
             return
         if not re.fullmatch(r"\d+(?:[\s,]+\d+)*", m.text.strip()):
             await try_delete(m)
-            await render(m, s, "⚠️ Укажите один или несколько ID цифрами через запятую или пробел.",
-                         InlineKeyboardMarkup(inline_keyboard=[btn("Отмена", "adm:home")]))
+            expected = "один ID" if operation["operation"] == "edit" else "один или несколько ID"
+            await render(m, s, f"⚠️ Укажите {expected} цифрами через запятую или пробел.",
+                         InlineKeyboardMarkup(inline_keyboard=[
+                             btn("◀️ К списку", f"adm:roles:{role}"), btn("Отмена", "adm:home")]))
             return
         ids = list(dict.fromkeys(str(int(value)) for value in re.findall(r"\d+", m.text)))
-        if any(value == "0" for value in ids):
+        if any(value == "0" for value in ids) or (
+                operation["operation"] == "edit" and len(ids) != 1):
             await try_delete(m)
-            await render(m, s, "⚠️ Telegram ID должен быть положительным числом.",
-                         InlineKeyboardMarkup(inline_keyboard=[btn("Отмена", "adm:home")]))
+            error = ("Для замены укажите ровно один ID." if operation["operation"] == "edit"
+                     else "Telegram ID должен быть положительным числом.")
+            await render(m, s, f"⚠️ {error}",
+                         InlineKeyboardMarkup(inline_keyboard=[
+                             btn("◀️ К списку", f"adm:roles:{role}"), btn("Отмена", "adm:home")]))
             return
-        setting_key = "admin_ids" if role == "admin" else "manager_ids"
-        current = settings.get(setting_key, [])
-        if not isinstance(current, list):
-            current = []
-        current = list(dict.fromkeys(str(value) for value in current))
-        new_ids = [value for value in ids if value not in current]
+        if operation["operation"] == "edit":
+            new_id = ids[0]
+            old_id = operation["old_id"]
+            if new_id == old_id:
+                await try_delete(m)
+                await render(m, s, "ℹ️ Новый ID совпадает с текущим.",
+                             InlineKeyboardMarkup(inline_keyboard=[
+                                 btn("◀️ К списку", f"adm:roles:{role}"), btn("Отмена", "adm:home")]))
+                return
+            if new_id in role_ids(role):
+                await try_delete(m)
+                await render(m, s, "⚠️ Этот ID уже есть в списке.",
+                             InlineKeyboardMarkup(inline_keyboard=[
+                                 btn("◀️ К списку", f"adm:roles:{role}"), btn("Отмена", "adm:home")]))
+                return
+            update_role_ids(role, add=[new_id], remove=[old_id])
+            changed_text = f"✅ ID {old_id} заменён на {new_id}."
+        else:
+            new_ids = [value for value in ids if value not in role_ids(role)]
+            if not new_ids:
+                s["role_add"] = None
+                await try_delete(m)
+                text, markup = roles_screen(role, m.from_user.id)
+                await render(m, s, f"ℹ️ Все указанные ID уже есть в списке.\n\n{text}", markup)
+                return
+            update_role_ids(role, add=new_ids)
+            changed_text = f"✅ Добавлены ID: {', '.join(new_ids)}."
         s["role_add"] = None
         await try_delete(m)
-        if not new_ids:
-            await render(m, s, "ℹ️ Все указанные ID уже добавлены.",
-                         InlineKeyboardMarkup(inline_keyboard=[btn("🔧 К админ-панели", "adm:home")]))
-            return
-        settings[setting_key] = current + new_ids
-        save_json(SETTINGS_FILE, settings)
-        role_name = "администраторы" if role == "admin" else "менеджеры"
-        await render(m, s, f"✅ Добавлено в список ({role_name}): {', '.join(new_ids)}.\n"
-                           "🔄 Перезагружаю бота…",
+        await render(m, s, f"{changed_text}\n🔄 Перезагружаю бота…",
                      InlineKeyboardMarkup(inline_keyboard=[btn("🔧 К админ-панели", "adm:home")]))
         await request_restart(m.from_user.id)
         return
