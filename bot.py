@@ -53,6 +53,11 @@ def step_text(step):
     return overrides.get(step["id"], step["text"])
 
 
+def privacy_confirmed(uid):
+    accepted = settings.get("privacy_accepted", [])
+    return isinstance(accepted, list) and str(uid) in {str(value) for value in accepted}
+
+
 def is_admin(uid):
     ids = {x for x in re.split(r"[,\s]+", os.getenv("ADMIN_IDS", "")) if x}
     stored = settings.get("admin_ids", [])
@@ -77,6 +82,8 @@ def is_manager(uid):
 
 # ───────────────────────── Меню бота (кнопка «Меню» рядом с полем ввода) ─────────────────────────
 def menu_commands(uid, in_branch):
+    if not privacy_confirmed(uid):
+        return []
     cmds = [BotCommand(command="start", description="Вернуться к началу" if in_branch else "Начать"),
             BotCommand(command="contacts", description="Контакты")]
     if is_manager(uid) or is_admin(uid):
@@ -90,7 +97,7 @@ async def update_menu(bot: Bot, chat_id, s, force=False):
     """«Начать» → «Вернуться к началу», как только клиент ушёл в какую-либо ветку."""
     uid, st = s["user"]["id"], s["stack"]
     in_branch = bool(st) and st[-1] not in ("privacy", "main")
-    key = (in_branch, is_manager(uid), is_admin(uid))
+    key = (privacy_confirmed(uid), in_branch, is_manager(uid), is_admin(uid))
     if not force and s.get("menu_key") == key:
         return
     try:
@@ -102,7 +109,8 @@ async def update_menu(bot: Bot, chat_id, s, force=False):
 
 async def clear_kb(m: Message):
     """Убираем старую нижнюю клавиатуру (если осталась с прошлой версии бота)."""
-    carrier = await m.answer("⌨️", reply_markup=ReplyKeyboardRemove(), disable_notification=True)
+    carrier = await m.bot.send_message(m.chat.id, "⌨️", reply_markup=ReplyKeyboardRemove(),
+                                       disable_notification=True)
     await try_delete(carrier)
 
 
@@ -271,10 +279,85 @@ async def render(msg: Message, s, text, markup):
                 return
     sent = await msg.bot.send_message(msg.chat.id, text, reply_markup=markup)
     s["menu"] = sent.message_id
+    s["menu_chat_id"] = msg.chat.id
+    track_chat_message(s, sent.message_id, msg.chat.id)
+
+
+def track_chat_message(s, message_id, chat_id):
+    chat_key = str(chat_id)
+    tracked = s.setdefault("chat_messages", {}).setdefault(chat_key, [])
+    if message_id not in tracked:
+        tracked.append(message_id)
+    cleanup = settings.setdefault("chat_cleanup", {})
+    ids = cleanup.setdefault(chat_key, [])
+    if message_id not in ids:
+        ids.append(message_id)
+        cleanup[chat_key] = ids[-100:]
+        save_json(SETTINGS_FILE, settings)
+
+
+async def clear_chat(msg: Message, s):
+    await try_delete(msg)
+    cleanup = settings.get("chat_cleanup", {})
+    chat_key = str(msg.chat.id)
+    persisted_ids = cleanup.get(chat_key, []) if isinstance(cleanup, dict) else []
+    session_ids = s.get("chat_messages", {}).get(chat_key, [])
+    message_ids = list(dict.fromkeys(
+        session_ids + persisted_ids
+        + ([s.get("menu")] if s.get("menu_chat_id") == msg.chat.id else [])
+        + ([s.get("menu_hint")] if s.get("menu_hint_chat_id") == msg.chat.id else [])
+    ))
+    for message_id in message_ids:
+        if message_id is None:
+            continue
+        try:
+            await msg.bot.delete_message(msg.chat.id, message_id)
+        except TelegramBadRequest:
+            pass
+    s.get("chat_messages", {}).pop(chat_key, None)
+    if s.get("menu_chat_id") == msg.chat.id:
+        s.pop("menu", None)
+        s.pop("menu_chat_id", None)
+    if s.get("menu_hint_chat_id") == msg.chat.id:
+        s.pop("menu_hint", None)
+        s.pop("menu_hint_chat_id", None)
+    if isinstance(cleanup, dict):
+        cleanup.pop(chat_key, None)
+        save_json(SETTINGS_FILE, settings)
+
+
+async def show_privacy(msg: Message, s):
+    step = STEPS["privacy"]
+    text = step_text(step)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Согласен, продолжить", callback_data="privacy:accept")]
+    ])
+    await render(msg, s, text, markup)
+    await update_menu(msg.bot, msg.chat.id, s, force=True)
+
+
+async def require_privacy(msg: Message, s):
+    if privacy_confirmed(msg.from_user.id):
+        return True
+    await clear_chat(msg, s)
+    await show_privacy(msg, s)
+    return False
+
+
+async def require_privacy_callback(cb: CallbackQuery, s):
+    if privacy_confirmed(cb.from_user.id):
+        return True
+    await clear_chat(cb.message, s)
+    await show_privacy(cb.message, s)
+    await cb.answer("Сначала подтвердите политику конфиденциальности.", show_alert=True)
+    return False
 
 
 async def clear_menu_hint(msg: Message, s):
+    if s.get("menu_hint_chat_id") != msg.chat.id:
+        return
     hint_id = s.pop("menu_hint", None)
+    s.pop("menu_hint_chat_id", None)
     if hint_id:
         try:
             await msg.bot.delete_message(msg.chat.id, hint_id)
@@ -286,6 +369,8 @@ async def send_menu_hint(msg: Message, s, text, markup=None):
     await clear_menu_hint(msg, s)
     hint = await msg.bot.send_message(msg.chat.id, text, reply_markup=markup)
     s["menu_hint"] = hint.message_id
+    s["menu_hint_chat_id"] = msg.chat.id
+    track_chat_message(s, hint.message_id, msg.chat.id)
 
 
 async def show(msg: Message, s, sid, notice=""):
@@ -322,7 +407,8 @@ async def _delete_later(*msgs: Message, delay=TEMP_TTL):
 
 async def answer_temp(m: Message, text, delay=TEMP_TTL):
     """Служебное сообщение: показываем, а через `delay` секунд удаляем вместе с командой клиента."""
-    sent = await m.answer(text)
+    sent = await m.bot.send_message(m.chat.id, text)
+    track_chat_message(sess(m.from_user), sent.message_id, m.chat.id)
     task = asyncio.create_task(_delete_later(m, sent, delay=delay))
     _bg.add(task)
     task.add_done_callback(_bg.discard)
@@ -443,37 +529,57 @@ async def submit_lead(bot: Bot, s):
 # ───────────────────────── Команды клиента ─────────────────────────
 @router.message(CommandStart())
 async def cmd_start(m: Message):
-    await try_delete(m)
-    old = sessions.pop(m.from_user.id, None)
-    if old and old.get("menu"):         # убираем прежнее меню, чтобы осталось одно
-        try:
-            await m.bot.delete_message(m.chat.id, old["menu"])
-        except TelegramBadRequest:
-            pass
     s = sess(m.from_user)
-    await go(m, s, "privacy")
+    await clear_chat(m, s)
+    if not privacy_confirmed(m.from_user.id):
+        s.update(stack=[], ans={}, files=[], ask=None, submitted=False)
+        await show_privacy(m, s)
+        return
+    s.update(stack=[], ans={}, files=[], ask=None, submitted=False)
+    await go(m, s, "main")
     await clear_kb(m)
 
 
 @router.message(Command("menu"))
 async def cmd_menu(m: Message):
-    await try_delete(m)
     s = sess(m.from_user)
+    if not await require_privacy(m, s):
+        return
+    await clear_chat(m, s)
     s["role_add"] = None
     s["menu_edit"] = None
-    await clear_menu_hint(m, s)
     await go(m, s, "main")
 
 
 @router.message(Command("myid"))
 async def cmd_myid(m: Message):
+    s = sess(m.from_user)
+    if not await require_privacy(m, s):
+        return
+    await clear_chat(m, s)
     await answer_temp(m, f"Ваш Telegram ID: {m.from_user.id}\nID этого чата: {m.chat.id}", delay=60)
+
+
+@router.callback_query(F.data == "privacy:accept")
+async def cb_privacy_accept(cb: CallbackQuery):
+    s = sess(cb.from_user)
+    if not privacy_confirmed(cb.from_user.id):
+        accepted = settings.setdefault("privacy_accepted", [])
+        if not isinstance(accepted, list):
+            accepted = settings["privacy_accepted"] = []
+        accepted.append(str(cb.from_user.id))
+        save_json(SETTINGS_FILE, settings)
+    s["menu"] = cb.message.message_id
+    s.update(stack=[], ans={}, files=[], ask=None, submitted=False)
+    await go(cb.message, s, "main")
+    await cb.answer("Спасибо за подтверждение.")
 
 
 # ───────────────────────── Админ-панель ─────────────────────────
 def admin_home():
     return ("🔧 Панель администратора", InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧭 Редактировать меню и пункты", callback_data="adm:menu")],
+        [InlineKeyboardButton(text="↩️ Сбросить все меню и выборы", callback_data="adm:resetall")],
         [InlineKeyboardButton(text="📋 Заявки", callback_data="ld:l:0")],
         [InlineKeyboardButton(text="📬 Куда приходят заявки", callback_data="adm:mgr")],
         [InlineKeyboardButton(text="➕ Добавить администратора", callback_data="adm:addadmin")],
@@ -515,6 +621,7 @@ async def show_menu_editor(msg: Message, s, notice=""):
          InlineKeyboardButton(text="👁 Скрыть / показать", callback_data="adm:menumode:hide")],
         [InlineKeyboardButton(text="🗑 Удалить пункт", callback_data="adm:menumode:delete"),
          InlineKeyboardButton(text="➕ Добавить пункт", callback_data="adm:menumode:add")],
+        [InlineKeyboardButton(text="↩️ К стандартному виду", callback_data="adm:menureset")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="adm:menuback"),
          InlineKeyboardButton(text="🔧 К панели", callback_data="adm:home")],
     ])
@@ -535,17 +642,24 @@ async def request_restart(user_id):
 
 @router.message(Command("admin"))
 async def cmd_admin(m: Message):
+    s = sess(m.from_user)
+    if not await require_privacy(m, s):
+        return
+    await clear_chat(m, s)
     if not is_admin(m.from_user.id):
         await answer_temp(m, f"Нет доступа. Ваш ID: {m.from_user.id}.\nЧтобы стать администратором, впишите "
                              "этот ID в ADMIN_IDS в файле .env или попросите текущего администратора добавить "
                              "вас через админ-панель.", delay=60)
         return
-    await try_delete(m)
-    await open_admin(m, sess(m.from_user))
+    await open_admin(m, s)
 
 
 @router.message(Command("setmanager"))
 async def cmd_setmanager(m: Message):
+    s = sess(m.from_user)
+    if not await require_privacy(m, s):
+        return
+    await clear_chat(m, s)
     if not is_admin(m.from_user.id):
         return
     settings["manager_chat"] = m.chat.id
@@ -556,12 +670,13 @@ async def cmd_setmanager(m: Message):
 
 @router.message(Command("contacts"))
 async def cmd_contacts(m: Message):
-    await try_delete(m)
     s = sess(m.from_user)
+    if not await require_privacy(m, s):
+        return
+    await clear_chat(m, s)
     s["ask"] = None
     s["role_add"] = None
     s["menu_edit"] = None
-    await clear_menu_hint(m, s)
     if not s["stack"]:
         s["stack"] = ["main"]
     await go(m, s, "contacts")
@@ -569,14 +684,15 @@ async def cmd_contacts(m: Message):
 
 @router.message(Command("leads"))
 async def cmd_leads(m: Message):
+    s = sess(m.from_user)
+    if not await require_privacy(m, s):
+        return
+    await clear_chat(m, s)
     if not (is_admin(m.from_user.id) or is_manager(m.from_user.id)):
         return
-    await try_delete(m)
-    s = sess(m.from_user)
     s["ask"] = None
     s["role_add"] = None
     s["menu_edit"] = None
-    await clear_menu_hint(m, s)
     await show_leads(m, s, 0)
 
 
@@ -586,10 +702,12 @@ def btn(text, data):
 
 @router.callback_query(F.data.startswith("adm:"))
 async def cb_admin(cb: CallbackQuery):
+    s = sess(cb.from_user)
+    if not await require_privacy_callback(cb, s):
+        return
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
-    s = sess(cb.from_user)
     s["menu"] = cb.message.message_id
     _, act, *rest = cb.data.split(":", 2)
     arg = rest[0] if rest else ""
@@ -603,6 +721,49 @@ async def cb_admin(cb: CallbackQuery):
         await clear_menu_hint(cb.message, s)
         await show_menu_editor(cb.message, s)
         await cb.answer()
+        return
+    elif act == "resetall":
+        text = "Сбросить все тексты и настройки пунктов меню к стандартному виду? Это действие нельзя отменить."
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            btn("✅ Да, сбросить всё", "adm:resetallconfirm"),
+            btn("Отмена", "adm:home"),
+        ])
+        await render(cb.message, s, text, markup)
+        await cb.answer()
+        return
+    elif act == "resetallconfirm":
+        overrides.clear()
+        settings.pop("menu_choices", None)
+        save_json(OVERRIDES_FILE, overrides)
+        save_json(SETTINGS_FILE, settings)
+        s["menu_edit"] = None
+        await clear_menu_hint(cb.message, s)
+        text, markup = admin_home()
+        await render(cb.message, s, text, markup)
+        await send_menu_hint(cb.message, s, "✅ Все меню и выборы возвращены к стандартному виду.")
+        await cb.answer("Все меню сброшены.")
+        return
+    elif act == "menureset":
+        editor = s.get("menu_edit")
+        if not editor:
+            await cb.answer("Редактор завершён. Откройте его заново.", show_alert=True)
+            return
+        sid = editor["stack"][-1]
+        overrides.pop(sid, None)
+        settings.get("menu_choices", {}).pop(sid, None)
+        if not settings.get("menu_choices"):
+            settings.pop("menu_choices", None)
+        save_json(OVERRIDES_FILE, overrides)
+        save_json(SETTINGS_FILE, settings)
+        editor["action"] = "open"
+        editor.pop("pending", None)
+        editor.pop("choice_key", None)
+        editor.pop("pending_label", None)
+        editor.pop("routes", None)
+        await clear_menu_hint(cb.message, s)
+        await show_menu_editor(cb.message, s)
+        await send_menu_hint(cb.message, s, "✅ Этот экран и его пункты возвращены к стандартному виду.")
+        await cb.answer("Текущий экран сброшен.")
         return
     elif act == "menuback":
         editor = s.get("menu_edit")
@@ -874,11 +1035,13 @@ async def ask_lead_ids(msg: Message, s, notice=""):
 
 @router.callback_query(F.data.startswith("ld:"))
 async def cb_leads(cb: CallbackQuery):
+    s = sess(cb.from_user)
+    if not await require_privacy_callback(cb, s):
+        return
     uid = cb.from_user.id
     if not (is_admin(uid) or is_manager(uid)):
         await cb.answer("Нет доступа", show_alert=True)
         return
-    s = sess(cb.from_user)
     s["menu"] = cb.message.message_id
     s["menu_edit"] = None
     await clear_menu_hint(cb.message, s)
@@ -931,6 +1094,8 @@ async def cb_leads(cb: CallbackQuery):
 # ───────────────────────── Кнопки сценария ─────────────────────────
 async def guard(cb: CallbackQuery):
     s = sess(cb.from_user)
+    if not await require_privacy_callback(cb, s):
+        return None
     if not s["stack"]:
         await cb.answer("Сессия устарела, отправьте /start", show_alert=True)
         return None
@@ -1054,6 +1219,16 @@ def extract(m: Message, s):
 @router.message()
 async def on_message(m: Message):
     s = sess(m.from_user)
+    if not privacy_confirmed(m.from_user.id):
+        await clear_chat(m, s)
+        await show_privacy(m, s)
+        return
+
+    if not is_admin(m.from_user.id):
+        current_step = STEPS.get(s["stack"][-1]) if s["stack"] else None
+        if not s.get("ask") and not (current_step and current_step.get("accept_text")):
+            await try_delete(m)
+            return
 
     editor = s.get("menu_edit")
     if editor and editor.get("pending") and is_admin(m.from_user.id):
@@ -1216,7 +1391,11 @@ async def main(dp: Dispatcher):
         if restart_user_id is not None:
             if is_admin(restart_user_id):
                 text, markup = admin_home()
-                await bot.send_message(restart_user_id, text, reply_markup=markup)
+                sent = await bot.send_message(restart_user_id, text, reply_markup=markup)
+                cleanup = settings.setdefault("chat_cleanup", {})
+                ids = cleanup.setdefault(str(restart_user_id), [])
+                ids.append(sent.message_id)
+                cleanup[str(restart_user_id)] = ids[-100:]
                 log.info("Админ-панель открыта после перезапуска для пользователя %s", restart_user_id)
             else:
                 log.warning("Не удалось открыть админ-панель: пользователь %s больше не администратор",
