@@ -13,7 +13,8 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+                           Message, ReplyKeyboardMarkup)
 from dotenv import load_dotenv
 
 from scenario import BACK, GROUPS, STEPS
@@ -57,6 +58,52 @@ def manager_chat():
     return settings.get("manager_chat") or os.getenv("MANAGER_CHAT_ID") or None
 
 
+def is_manager(uid):
+    """Менеджер: тот, чей личный чат указан для заявок, либо ID из MANAGER_IDS в .env."""
+    ids = {x for x in re.split(r"[,\s]+", os.getenv("MANAGER_IDS", "")) if x}
+    mc = manager_chat()
+    return str(uid) in ids or (mc is not None and str(mc) == str(uid))
+
+
+# ───────────────────────── Стартовые кнопки (внизу экрана) ─────────────────────────
+BTN_MENU, BTN_CONTACTS = "🏠 Главное меню", "📞 Контакты"
+BTN_ADMIN, BTN_LEADS = "🔧 Админ-панель", "📋 Последние заявки"
+REPLY_BUTTONS = {BTN_MENU, BTN_CONTACTS, BTN_ADMIN, BTN_LEADS}
+
+
+def reply_kb(uid):
+    rows = [[KeyboardButton(text=BTN_MENU), KeyboardButton(text=BTN_CONTACTS)]]
+    extra = []
+    if is_manager(uid) or is_admin(uid):
+        extra.append(KeyboardButton(text=BTN_LEADS))
+    if is_admin(uid):
+        extra.append(KeyboardButton(text=BTN_ADMIN))
+    if extra:
+        rows.append(extra)
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+
+async def refresh_kb(m: Message):
+    """Клавиатура привязана к сообщению: отправляем его и сразу удаляем, кнопки остаются."""
+    carrier = await m.answer("⌨️", reply_markup=reply_kb(m.from_user.id))
+    await try_delete(carrier)
+
+
+def leads_text(limit=5):
+    try:
+        with LEADS_FILE.open(encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.reader(f, delimiter=";"))[1:]
+    except FileNotFoundError:
+        rows = []
+    if not rows:
+        return "📋 Заявок пока нет."
+    out = [f"📋 Последние заявки (всего {len(rows)}):"]
+    for r in reversed(rows[-limit:]):
+        date, name, phone, _, when, tg, flow, est = (r + [""] * 8)[:8]
+        out.append(f"\n{date} · {name}\n📞 {phone} · {tg}\n📌 {flow}" + (f"\n💰 {est}" if est else ""))
+    return "\n".join(out)[:3900]
+
+
 # ───────────────────────── Сессии ─────────────────────────
 sessions: dict = {}
 
@@ -95,21 +142,41 @@ def keyboard(step, s):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def show(msg: Message, s, sid, edit=True):
-    step = STEPS[sid]
-    text = step_text(step).replace("{name}", client_name(s))
-    markup = keyboard(step, s)
-    if edit:
+async def render(msg: Message, s, text, markup):
+    """Единственное меню: редактируем сохранённое сообщение, новое шлём только если старого нет."""
+    mid = s.get("menu")
+    if mid:
         try:
-            await msg.edit_text(text, reply_markup=markup)
+            await msg.bot.edit_message_text(text, chat_id=msg.chat.id, message_id=mid, reply_markup=markup)
             return
         except TelegramBadRequest as e:
             if "not modified" in str(e):
                 return
-    await msg.answer(text, reply_markup=markup)
+    sent = await msg.bot.send_message(msg.chat.id, text, reply_markup=markup)
+    s["menu"] = sent.message_id
 
 
-async def go(msg: Message, s, sid, edit=True):
+async def show(msg: Message, s, sid, notice=""):
+    step = STEPS[sid]
+    text = step_text(step).replace("{name}", client_name(s))
+    if notice:
+        text = f"{notice}\n\n{text}"
+    await render(msg, s, text, keyboard(step, s))
+
+
+async def prompt(msg: Message, s, text):
+    """Вопрос «Напишите…» показываем в том же меню, с кнопкой отмены."""
+    await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=[btn(BACK, "cancelask")]))
+
+
+async def try_delete(m: Message):
+    try:
+        await m.delete()
+    except TelegramBadRequest:
+        pass
+
+
+async def go(msg: Message, s, sid, notice=""):
     if sid == "main":                   # главное меню = начать заявку заново
         s.update(stack=["main"], ans={}, files=[], ask=None, submitted=False)
     else:
@@ -117,7 +184,7 @@ async def go(msg: Message, s, sid, edit=True):
     if sid == "f_done" and not s["submitted"]:
         s["submitted"] = True
         await submit_lead(msg.bot, s)
-    await show(msg, s, sid, edit)
+    await show(msg, s, sid, notice)
 
 
 def next_of(step, opt, s):
@@ -225,14 +292,22 @@ async def submit_lead(bot: Bot, s):
 # ───────────────────────── Команды клиента ─────────────────────────
 @router.message(CommandStart())
 async def cmd_start(m: Message):
-    sessions.pop(m.from_user.id, None)
+    await try_delete(m)
+    old = sessions.pop(m.from_user.id, None)
+    if old and old.get("menu"):         # убираем прежнее меню, чтобы осталось одно
+        try:
+            await m.bot.delete_message(m.chat.id, old["menu"])
+        except TelegramBadRequest:
+            pass
     s = sess(m.from_user)
-    await go(m, s, "privacy", edit=False)
+    await refresh_kb(m)
+    await go(m, s, "privacy")
 
 
 @router.message(Command("menu"))
 async def cmd_menu(m: Message):
-    await go(m, sess(m.from_user), "main", edit=False)
+    await try_delete(m)
+    await go(m, sess(m.from_user), "main")
 
 
 @router.message(Command("myid"))
@@ -244,7 +319,14 @@ async def cmd_myid(m: Message):
 def admin_home():
     return ("🔧 Панель администратора", InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Тексты сообщений", callback_data="adm:groups")],
-        [InlineKeyboardButton(text="📬 Куда приходят заявки", callback_data="adm:mgr")]]))
+        [InlineKeyboardButton(text="📬 Куда приходят заявки", callback_data="adm:mgr")],
+        [InlineKeyboardButton(text="✖️ Закрыть", callback_data="adm:exit")]]))
+
+
+async def open_admin(m: Message, s):
+    s["ask"] = None
+    text, markup = admin_home()
+    await render(m, s, text, markup)        # панель открывается в том же единственном меню
 
 
 @router.message(Command("admin"))
@@ -253,8 +335,8 @@ async def cmd_admin(m: Message):
         await m.answer(f"Нет доступа. Ваш ID: {m.from_user.id}.\nЧтобы стать администратором, впишите "
                        "этот ID в ADMIN_IDS в файле .env и перезапустите бота.")
         return
-    text, markup = admin_home()
-    await m.answer(text, reply_markup=markup)
+    await try_delete(m)
+    await open_admin(m, sess(m.from_user))
 
 
 @router.message(Command("setmanager"))
@@ -264,6 +346,26 @@ async def cmd_setmanager(m: Message):
     settings["manager_chat"] = m.chat.id
     save_json(SETTINGS_FILE, settings)
     await m.answer("✅ Готово. Новые заявки будут приходить в этот чат.")
+    await refresh_kb(m)                     # обновляем кнопки (появятся кнопки менеджера)
+
+
+@router.message(F.text.in_(REPLY_BUTTONS))
+async def on_reply_button(m: Message):
+    await try_delete(m)
+    s, t, uid = sess(m.from_user), m.text, m.from_user.id
+    s["ask"] = None
+    if t == BTN_ADMIN:
+        if is_admin(uid):
+            await open_admin(m, s)
+    elif t == BTN_LEADS:
+        if is_admin(uid) or is_manager(uid):
+            await render(m, s, leads_text(), InlineKeyboardMarkup(inline_keyboard=[btn("✖️ Закрыть", "adm:exit")]))
+    elif t == BTN_CONTACTS:
+        if not s["stack"]:
+            s["stack"] = ["main"]
+        await go(m, s, "contacts")
+    else:
+        await go(m, s, "main")
 
 
 def btn(text, data):
@@ -276,10 +378,18 @@ async def cb_admin(cb: CallbackQuery):
         await cb.answer("Нет доступа", show_alert=True)
         return
     s = sess(cb.from_user)
+    s["menu"] = cb.message.message_id
     _, act, *rest = cb.data.split(":", 2)
     arg = rest[0] if rest else ""
     groups = list(GROUPS)
     s["adm_edit"] = None
+    if act == "exit":                       # закрыть панель: вернуться на прежний экран
+        if s["stack"]:
+            await show(cb.message, s, s["stack"][-1])
+        else:
+            await go(cb.message, s, "main")
+        await cb.answer()
+        return
     if act == "home":
         text, markup = admin_home()
     elif act == "groups":
@@ -331,6 +441,7 @@ async def guard(cb: CallbackQuery):
     if not s["stack"]:
         await cb.answer("Сессия устарела, отправьте /start", show_alert=True)
         return None
+    s["menu"] = cb.message.message_id
     return s
 
 
@@ -349,8 +460,16 @@ async def cb_back(cb: CallbackQuery):
 async def cb_cancelask(cb: CallbackQuery):
     if not (s := await guard(cb)):
         return
-    s["ask"] = None
-    await show(cb.message, s, s["stack"][-1])
+    ask, s["ask"] = s["ask"], None
+    cur = STEPS[s["stack"][-1]]
+    if ask and cur["type"] == "multi":      # отмена ввода в мульти-выборе снимает отметку
+        a = s["ans"].get(ask["step"])
+        if a:
+            label = cur["options"][ask["opt"]]["label"]
+            if label in a["sel"]:
+                a["sel"].remove(label)
+            a["extra"].pop(label, None)
+    await show(cb.message, s, cur["id"])
     await cb.answer()
 
 
@@ -392,9 +511,10 @@ async def cb_option(cb: CallbackQuery):
                     a["extra"].pop(x, None)
             a["sel"].append(label)
         s["ask"] = {"step": sid, "opt": i} if opt["ask"] and label in a["sel"] else None
-        await show(cb.message, s, sid)
         if s["ask"]:
-            await cb.message.answer(opt["ask"])
+            await prompt(cb.message, s, opt["ask"])
+        else:
+            await show(cb.message, s, sid)
         await cb.answer()
         return
 
@@ -406,16 +526,10 @@ async def cb_option(cb: CallbackQuery):
         s["ans"][sid] = {"title": step["title"], "sel": [label], "extra": {}}
     if opt["ask"]:
         s["ask"] = {"step": sid, "opt": i}
-        await cb.message.edit_text(opt["ask"], reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[btn(BACK, "cancelask")]))
+        await prompt(cb.message, s, opt["ask"])
         await cb.answer()
         return
-    nxt = next_of(step, opt, s)
-    if opt["say"]:
-        await cb.message.edit_text(opt["say"])
-        await go(cb.message, s, nxt, edit=False)
-    else:
-        await go(cb.message, s, nxt)
+    await go(cb.message, s, next_of(step, opt, s), notice=opt["say"] or "")
     await cb.answer()
 
 
@@ -442,16 +556,18 @@ async def on_message(m: Message):
         sid, s["adm_edit"] = s["adm_edit"], None
         overrides[sid] = m.text
         save_json(OVERRIDES_FILE, overrides)
-        await m.answer("✅ Текст сохранён. Бот уже использует новый вариант.\nОткрыть /admin")
+        await try_delete(m)
+        await render(m, s, "✅ Текст сохранён. Бот уже использует новый вариант.",
+                     InlineKeyboardMarkup(inline_keyboard=[btn("🔧 К админ-панели", "adm:home")]))
         return
 
     if not s["stack"]:
         await cmd_start(m)
         return
     step = STEPS[s["stack"][-1]]
-    value = extract(m, s)
+    value = extract(m, s)                           # file_id сохраняется до удаления сообщения
+    await try_delete(m)                             # сообщения клиента не остаются в чате
     if value is None:
-        await m.answer("Пожалуйста, отправьте текст или файл.")
         return
 
     if s["ask"]:                                    # клиент отвечает на «Напишите…»
@@ -461,17 +577,15 @@ async def on_message(m: Message):
         a["extra"][opt["label"]] = value
         s["ask"] = None
         if st["type"] == "multi":
-            await m.answer("Принято ✅ Продолжайте выбор или нажмите «Далее».")
+            await show(m, s, st["id"])              # возвращаем то же меню с отметками
         else:
-            await go(m, s, next_of(st, opt, s), edit=False)
+            await go(m, s, next_of(st, opt, s))
     elif step.get("accept_text"):
         if step.get("validate") == "phone" and not 7 <= len(re.sub(r"\D", "", value)) <= 15:
-            await m.answer("Не похоже на номер телефона. Введите, например: +7 999 123-45-67")
+            await show(m, s, step["id"], notice="⚠️ Не похоже на номер телефона. Введите, например: +7 999 123-45-67")
             return
         s["ans"][step["id"]] = {"title": step["title"], "sel": [value], "extra": {}}
-        await go(m, s, next_of(step, None, s), edit=False)
-    else:
-        await m.answer("Пожалуйста, выберите вариант кнопкой выше 👆")
+        await go(m, s, next_of(step, None, s))
 
 
 # ───────────────────────── Запуск ─────────────────────────
