@@ -109,7 +109,7 @@ async def update_menu(bot: Bot, chat_id, s, force=False):
 
 async def clear_kb(m: Message):
     """Убираем старую нижнюю клавиатуру (если осталась с прошлой версии бота)."""
-    carrier = await m.bot.send_message(m.chat.id, "⌨️", reply_markup=ReplyKeyboardRemove(),
+    carrier = await m.bot.send_message(m.chat.id, "\u2063", reply_markup=ReplyKeyboardRemove(),
                                        disable_notification=True)
     await try_delete(carrier)
 
@@ -251,6 +251,14 @@ def effective_options(step, include_hidden=False):
         option["_hidden"] = key in config.get("hidden", [])
         options.append(option)
     return options
+
+
+def allows_added_choices(step):
+    options = effective_options(step, include_hidden=True)
+    if not step.get("record", True) or not any(option.get("rec", True) for option in options):
+        return False
+    has_sequential_question = isinstance(step.get("next"), str) and step["next"] in STEPS
+    return has_sequential_question or all(option.get("rec", True) for option in options)
 
 
 def keyboard(step, s):
@@ -610,20 +618,31 @@ async def show_menu_editor(msg: Message, s, notice=""):
         await send_menu_hint(msg, s, notice)
     text = f"🛠 Редактор меню · {step['title']}\n\n{text}"
 
-    rows = []
+    rows = [[InlineKeyboardButton(text="— ПУНКТЫ ТЕКУЩЕГО МЕНЮ —", callback_data="adm:section")]]
     for option in effective_options(step, include_hidden=True):
         label = f"🙈 {option['label']}" if option["_hidden"] else option["label"]
         rows.append(btn(label[:60], f"adm:menuitem:{option['_menu_key']}"))
     rows.extend([
+        [InlineKeyboardButton(text="— ДЕЙСТВИЯ РЕДАКТОРА —", callback_data="adm:section")],
         [InlineKeyboardButton(text="🧭 Открыть подменю", callback_data="adm:menumode:open"),
          InlineKeyboardButton(text="✏️ Текст вопроса", callback_data="adm:menumode:text")],
         [InlineKeyboardButton(text="✏️ Изменить пункт", callback_data="adm:menumode:edit"),
          InlineKeyboardButton(text="👁 Скрыть / показать", callback_data="adm:menumode:hide")],
-        [InlineKeyboardButton(text="🗑 Удалить пункт", callback_data="adm:menumode:delete"),
-         InlineKeyboardButton(text="➕ Добавить пункт", callback_data="adm:menumode:add")],
-        [InlineKeyboardButton(text="↩️ К стандартному виду", callback_data="adm:menureset")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="adm:menuback"),
-         InlineKeyboardButton(text="🔧 К панели", callback_data="adm:home")],
+    ])
+    if allows_added_choices(step):
+        rows.append([InlineKeyboardButton(text="🗑 Удалить пункт", callback_data="adm:menumode:delete"),
+                     InlineKeyboardButton(text="➕ Добавить пункт", callback_data="adm:menumode:add")])
+    else:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить пункт", callback_data="adm:menumode:delete")])
+    next_step = step.get("next")
+    if isinstance(next_step, str) and next_step in STEPS:
+        rows.append([InlineKeyboardButton(text="➡️ Следующий вопрос", callback_data="adm:menunext")])
+    rows.extend([
+        [InlineKeyboardButton(text="— НАВИГАЦИЯ И СБРОС —", callback_data="adm:section")],
+        [InlineKeyboardButton(text="↩️ Вернуть меню к стандартному виду", callback_data="adm:menureset")],
+        [InlineKeyboardButton(text="◀️ Предыдущий пункт", callback_data="adm:menuprev"),
+         InlineKeyboardButton(text="🏠 Вернуться к стартовому меню", callback_data="adm:menustart")],
+        [InlineKeyboardButton(text="🔧 К панели", callback_data="adm:home")],
     ])
     await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -714,11 +733,64 @@ async def cb_admin(cb: CallbackQuery):
     groups = list(GROUPS)
     s["adm_edit"] = None
     s["role_add"] = None
-    if act == "menu":
+    if act == "section":
+        await cb.answer()
+        return
+    elif act == "menu":
         s["ask"] = None
         s["ld_ask"] = False
         s["menu_edit"] = {"stack": ["main"], "action": "open"}
         await clear_menu_hint(cb.message, s)
+        await show_menu_editor(cb.message, s)
+        await cb.answer()
+        return
+    elif act == "menunext":
+        editor = s.get("menu_edit")
+        if not editor:
+            await cb.answer("Редактор завершён. Откройте его заново.", show_alert=True)
+            return
+        step = STEPS[editor["stack"][-1]]
+        next_step = step.get("next")
+        if not isinstance(next_step, str) or next_step not in STEPS:
+            await cb.answer("У этого вопроса нет следующего шага.", show_alert=True)
+            return
+        push(editor, next_step)
+        editor["action"] = "open"
+        editor.pop("pending", None)
+        await clear_menu_hint(cb.message, s)
+        await show_menu_editor(cb.message, s)
+        await cb.answer()
+        return
+    elif act == "menuprev":
+        editor = s.get("menu_edit")
+        if not editor:
+            await cb.answer("Редактор завершён. Откройте его заново.", show_alert=True)
+            return
+        await clear_menu_hint(cb.message, s)
+        editor.pop("pending", None)
+        editor.pop("choice_key", None)
+        editor.pop("pending_label", None)
+        editor.pop("routes", None)
+        if len(editor["stack"]) > 1:
+            editor["stack"].pop()
+            editor["action"] = "open"
+            await show_menu_editor(cb.message, s)
+            await cb.answer()
+        else:
+            await cb.answer("Вы уже в первом меню.", show_alert=True)
+        return
+    elif act == "menustart":
+        editor = s.get("menu_edit")
+        if not editor:
+            await cb.answer("Редактор завершён. Откройте его заново.", show_alert=True)
+            return
+        await clear_menu_hint(cb.message, s)
+        editor["stack"] = ["main"]
+        editor["action"] = "open"
+        editor.pop("pending", None)
+        editor.pop("choice_key", None)
+        editor.pop("pending_label", None)
+        editor.pop("routes", None)
         await show_menu_editor(cb.message, s)
         await cb.answer()
         return
@@ -795,6 +867,12 @@ async def cb_admin(cb: CallbackQuery):
         mode = arg
         if mode not in ("open", "text", "edit", "hide", "delete", "add"):
             await cb.answer("Неизвестное действие.", show_alert=True)
+            return
+        if mode == "add" and not allows_added_choices(STEPS[editor["stack"][-1]]):
+            editor["action"] = "open"
+            await show_menu_editor(cb.message, s)
+            await cb.answer("Добавлять пункты можно только в выборах, которые записываются в заявку.",
+                            show_alert=True)
             return
         if mode == "text":
             editor["pending"] = "step_text"
@@ -1231,6 +1309,9 @@ async def on_message(m: Message):
             return
 
     editor = s.get("menu_edit")
+    if editor and is_admin(m.from_user.id) and editor.get("pending") == "route":
+        await try_delete(m)
+        return
     if editor and editor.get("pending") and is_admin(m.from_user.id):
         if not m.text or not m.text.strip():
             await try_delete(m)
@@ -1283,6 +1364,10 @@ async def on_message(m: Message):
             await send_menu_hint(m, s, "Выберите, куда будет вести новый пункт:",
                                  InlineKeyboardMarkup(inline_keyboard=route_buttons))
             return
+
+    if editor and is_admin(m.from_user.id):
+        await try_delete(m)
+        return
 
     if s.get("role_add") and is_admin(m.from_user.id):
         role = s["role_add"]
