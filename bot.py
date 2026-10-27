@@ -244,16 +244,38 @@ def build_xlsx(leads) -> bytes:
     for l in leads:
         ws.append([int(l["ID"]) if l["ID"].isdigit() else l["ID"]]
                   + [l[c] for c in LEAD_COLS[1:-1]] + [l["Ответы"].replace(" | ", "\n")])
-    for i, w in enumerate([6, 17, 20, 18, 22, 18, 18, 28, 22, 70]):
-        ws.column_dimensions[chr(65 + i)].width = w
+
+    max_widths = [14, 22, 32, 30, 34, 24, 24, 36, 30, 80]
+    widths = []
+    for column_index, header in enumerate(LEAD_COLS, start=1):
+        longest_line = len(header)
+        for row_index in range(2, ws.max_row + 1):
+            value = ws.cell(row=row_index, column=column_index).value
+            if value is not None:
+                longest_line = max([longest_line]
+                                   + [len(line) for line in str(value).splitlines()])
+        width = min(max(longest_line + 2, 12), max_widths[column_index - 1])
+        ws.column_dimensions[ws.cell(row=1, column=column_index).column_letter].width = width
+        widths.append(width)
+
     wrap = Alignment(wrap_text=True, vertical="top")
     for row in ws.iter_rows():
+        row_lines = 1
         for c in row:
             c.alignment = wrap
             if isinstance(c.value, str):
                 c.data_type = "s"                   # текст клиента не должен выполняться как формула
+            if c.value is not None:
+                usable_width = max(widths[c.column - 1] - 2, 1)
+                wrapped_lines = sum(
+                    max(1, math.ceil(len(line) / usable_width))
+                    for line in str(c.value).splitlines()
+                )
+                row_lines = max(row_lines, wrapped_lines)
+        ws.row_dimensions[row[0].row].height = min(409.5, max(18, row_lines * 15))
     for c in ws[1]:
         c.font = Font(bold=True)
+    ws.row_dimensions[1].height = 30
     ws.freeze_panes = "A2"
     buf = BytesIO()
     wb.save(buf)
