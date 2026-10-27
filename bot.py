@@ -13,8 +13,9 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-                           Message, ReplyKeyboardMarkup)
+from aiogram.types import (BotCommand, BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery,
+                           InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Message,
+                           ReplyKeyboardRemove)
 from dotenv import load_dotenv
 
 from scenario import BACK, GROUPS, STEPS
@@ -65,27 +66,34 @@ def is_manager(uid):
     return str(uid) in ids or (mc is not None and str(mc) == str(uid))
 
 
-# ───────────────────────── Стартовые кнопки (внизу экрана) ─────────────────────────
-BTN_MENU, BTN_CONTACTS = "🏠 Главное меню", "📞 Контакты"
-BTN_ADMIN, BTN_LEADS = "🔧 Админ-панель", "📋 Последние заявки"
-REPLY_BUTTONS = {BTN_MENU, BTN_CONTACTS, BTN_ADMIN, BTN_LEADS}
-
-
-def reply_kb(uid):
-    rows = [[KeyboardButton(text=BTN_MENU), KeyboardButton(text=BTN_CONTACTS)]]
-    extra = []
+# ───────────────────────── Меню бота (кнопка «Меню» рядом с полем ввода) ─────────────────────────
+def menu_commands(uid, in_branch):
+    cmds = [BotCommand(command="start", description="Вернуться к началу" if in_branch else "Начать"),
+            BotCommand(command="contacts", description="Контакты")]
     if is_manager(uid) or is_admin(uid):
-        extra.append(KeyboardButton(text=BTN_LEADS))
+        cmds.append(BotCommand(command="leads", description="Последние заявки"))
     if is_admin(uid):
-        extra.append(KeyboardButton(text=BTN_ADMIN))
-    if extra:
-        rows.append(extra)
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+        cmds.append(BotCommand(command="admin", description="Админ-панель"))
+    return cmds
 
 
-async def refresh_kb(m: Message):
-    """Клавиатура привязана к сообщению: отправляем его и сразу удаляем, кнопки остаются."""
-    carrier = await m.answer("⌨️", reply_markup=reply_kb(m.from_user.id))
+async def update_menu(bot: Bot, chat_id, s, force=False):
+    """«Начать» → «Вернуться к началу», как только клиент ушёл в какую-либо ветку."""
+    uid, st = s["user"]["id"], s["stack"]
+    in_branch = bool(st) and st[-1] not in ("privacy", "main")
+    key = (in_branch, is_manager(uid), is_admin(uid))
+    if not force and s.get("menu_key") == key:
+        return
+    try:
+        await bot.set_my_commands(menu_commands(uid, in_branch), scope=BotCommandScopeChat(chat_id=chat_id))
+        s["menu_key"] = key
+    except Exception:
+        log.exception("Не удалось обновить меню команд")
+
+
+async def clear_kb(m: Message):
+    """Убираем старую нижнюю клавиатуру (если осталась с прошлой версии бота)."""
+    carrier = await m.answer("⌨️", reply_markup=ReplyKeyboardRemove(), disable_notification=True)
     await try_delete(carrier)
 
 
@@ -162,6 +170,7 @@ async def show(msg: Message, s, sid, notice=""):
     if notice:
         text = f"{notice}\n\n{text}"
     await render(msg, s, text, keyboard(step, s))
+    await update_menu(msg.bot, msg.chat.id, s)
 
 
 async def prompt(msg: Message, s, text):
@@ -174,6 +183,25 @@ async def try_delete(m: Message):
         await m.delete()
     except TelegramBadRequest:
         pass
+
+
+TEMP_TTL = 15                           # через сколько секунд исчезают служебные сообщения
+_bg: set = set()
+
+
+async def _delete_later(*msgs: Message, delay=TEMP_TTL):
+    await asyncio.sleep(delay)
+    for x in msgs:
+        await try_delete(x)
+
+
+async def answer_temp(m: Message, text, delay=TEMP_TTL):
+    """Служебное сообщение: показываем, а через `delay` секунд удаляем вместе с командой клиента."""
+    sent = await m.answer(text)
+    task = asyncio.create_task(_delete_later(m, sent, delay=delay))
+    _bg.add(task)
+    task.add_done_callback(_bg.discard)
+    return sent
 
 
 async def go(msg: Message, s, sid, notice=""):
@@ -300,8 +328,8 @@ async def cmd_start(m: Message):
         except TelegramBadRequest:
             pass
     s = sess(m.from_user)
-    await refresh_kb(m)
     await go(m, s, "privacy")
+    await clear_kb(m)
 
 
 @router.message(Command("menu"))
@@ -312,7 +340,7 @@ async def cmd_menu(m: Message):
 
 @router.message(Command("myid"))
 async def cmd_myid(m: Message):
-    await m.answer(f"Ваш Telegram ID: {m.from_user.id}\nID этого чата: {m.chat.id}")
+    await answer_temp(m, f"Ваш Telegram ID: {m.from_user.id}\nID этого чата: {m.chat.id}", delay=60)
 
 
 # ───────────────────────── Админ-панель ─────────────────────────
@@ -332,8 +360,8 @@ async def open_admin(m: Message, s):
 @router.message(Command("admin"))
 async def cmd_admin(m: Message):
     if not is_admin(m.from_user.id):
-        await m.answer(f"Нет доступа. Ваш ID: {m.from_user.id}.\nЧтобы стать администратором, впишите "
-                       "этот ID в ADMIN_IDS в файле .env и перезапустите бота.")
+        await answer_temp(m, f"Нет доступа. Ваш ID: {m.from_user.id}.\nЧтобы стать администратором, впишите "
+                             "этот ID в ADMIN_IDS в файле .env и перезапустите бота.", delay=60)
         return
     await try_delete(m)
     await open_admin(m, sess(m.from_user))
@@ -345,27 +373,28 @@ async def cmd_setmanager(m: Message):
         return
     settings["manager_chat"] = m.chat.id
     save_json(SETTINGS_FILE, settings)
-    await m.answer("✅ Готово. Новые заявки будут приходить в этот чат.")
-    await refresh_kb(m)                     # обновляем кнопки (появятся кнопки менеджера)
+    await answer_temp(m, "✅ Готово. Новые заявки будут приходить в этот чат.")
+    await update_menu(m.bot, m.chat.id, sess(m.from_user), force=True)   # в меню появится «Последние заявки»
 
 
-@router.message(F.text.in_(REPLY_BUTTONS))
-async def on_reply_button(m: Message):
+@router.message(Command("contacts"))
+async def cmd_contacts(m: Message):
     await try_delete(m)
-    s, t, uid = sess(m.from_user), m.text, m.from_user.id
+    s = sess(m.from_user)
     s["ask"] = None
-    if t == BTN_ADMIN:
-        if is_admin(uid):
-            await open_admin(m, s)
-    elif t == BTN_LEADS:
-        if is_admin(uid) or is_manager(uid):
-            await render(m, s, leads_text(), InlineKeyboardMarkup(inline_keyboard=[btn("✖️ Закрыть", "adm:exit")]))
-    elif t == BTN_CONTACTS:
-        if not s["stack"]:
-            s["stack"] = ["main"]
-        await go(m, s, "contacts")
-    else:
-        await go(m, s, "main")
+    if not s["stack"]:
+        s["stack"] = ["main"]
+    await go(m, s, "contacts")
+
+
+@router.message(Command("leads"))
+async def cmd_leads(m: Message):
+    if not (is_admin(m.from_user.id) or is_manager(m.from_user.id)):
+        return
+    await try_delete(m)
+    s = sess(m.from_user)
+    s["ask"] = None
+    await render(m, s, leads_text(), InlineKeyboardMarkup(inline_keyboard=[btn("✖️ Закрыть", "adm:exit")]))
 
 
 def btn(text, data):
@@ -598,6 +627,10 @@ async def main():
     bot = Bot(token)
     dp = Dispatcher()
     dp.include_router(router)
+    await bot.set_my_commands([BotCommand(command="start", description="Начать"),
+                               BotCommand(command="contacts", description="Контакты")],
+                              scope=BotCommandScopeDefault())
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     me = await bot.get_me()
     log.info("Бот запущен: @%s. Остановка — Ctrl+C", me.username)
     await dp.start_polling(bot)
