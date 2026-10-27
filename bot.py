@@ -4,6 +4,7 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import os
 import re
 from datetime import datetime
@@ -321,6 +322,7 @@ def track_chat_message(s, message_id, chat_id):
 async def clear_chat(msg: Message, s, preserve_current=False):
     if not preserve_current:
         await try_delete(msg)
+    s["price_edit"] = None
     cleanup = settings.get("chat_cleanup", {})
     chat_key = str(msg.chat.id)
     persisted_ids = cleanup.get(chat_key, []) if isinstance(cleanup, dict) else []
@@ -605,6 +607,7 @@ async def cb_privacy_accept(cb: CallbackQuery):
 def admin_home():
     return ("🔧 Панель администратора", InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧭 Редактировать меню и пункты", callback_data="adm:menu")],
+        [InlineKeyboardButton(text="💰 Редактировать цены", callback_data="adm:prices")],
         [InlineKeyboardButton(text="↩️ Сбросить все меню и выборы", callback_data="adm:resetall")],
         [InlineKeyboardButton(text="📋 Заявки", callback_data="ld:l:0")],
         [InlineKeyboardButton(text="📬 Куда приходят заявки", callback_data="adm:mgr")],
@@ -614,11 +617,122 @@ def admin_home():
         [InlineKeyboardButton(text="✖️ Закрыть", callback_data="adm:exit")]]))
 
 
+def load_prices():
+    try:
+        config = json.loads(PRICES_FILE.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Не удалось прочитать prices.json.") from exc
+    if not isinstance(config, dict):
+        raise ValueError("Корень prices.json должен быть JSON-объектом.")
+    if not isinstance(config.get("base"), dict):
+        raise ValueError("В prices.json отсутствует объект base.")
+    if not isinstance(config.get("range"), list) or len(config["range"]) != 2:
+        raise ValueError("Поле range в prices.json должно содержать два коэффициента.")
+    if not isinstance(config.get("rules"), list):
+        raise ValueError("Поле rules в prices.json должно быть списком.")
+    if not isinstance(config.get("currency"), str):
+        raise ValueError("Поле currency в prices.json должно быть строкой.")
+
+    for key, value in config["base"].items():
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"Некорректная базовая цена «{key}» в prices.json.")
+    for value in config["range"]:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError("Коэффициенты range должны быть положительными числами.")
+    for index, rule in enumerate(config["rules"], 1):
+        if not isinstance(rule, dict) or not isinstance(rule.get("step"), str):
+            raise ValueError(f"Правило цен №{index} задано некорректно.")
+        price_keys = [key for key in ("add", "per_item") if key in rule]
+        if len(price_keys) != 1:
+            raise ValueError(f"В правиле цен №{index} должно быть одно поле add или per_item.")
+        if "add" in rule and not isinstance(rule.get("answer"), str):
+            raise ValueError(f"В правиле цен №{index} отсутствует текст answer.")
+        value = rule[price_keys[0]]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"Некорректная сумма в правиле цен №{index}.")
+    return config
+
+
+def price_fields(config):
+    base_labels = {
+        "p": "Товары",
+        "s": "Услуги",
+        "m": "Товары и услуги",
+        "r": "Доработка сайта",
+        "n": "Другое",
+    }
+    fields = [
+        {"path": "currency", "label": "Валюта", "value": config["currency"], "kind": "text"},
+        {"path": "range:0", "label": "Нижний коэффициент", "value": config["range"][0], "kind": "ratio"},
+        {"path": "range:1", "label": "Верхний коэффициент", "value": config["range"][1], "kind": "ratio"},
+    ]
+    for code, value in config["base"].items():
+        label = base_labels.get(code, code)
+        fields.append({"path": f"base:{code}", "label": f"База · {label}",
+                       "value": value, "kind": "amount"})
+    for index, rule in enumerate(config["rules"]):
+        key = "per_item" if "per_item" in rule else "add"
+        detail = f"· {rule['answer']}" if "answer" in rule else "за пункт"
+        label = f"{rule['step']} {detail} ({'за каждый выбор' if key == 'per_item' else 'доплата'})"
+        fields.append({"path": f"rule:{index}:{key}", "label": label,
+                       "value": rule[key], "kind": "amount"})
+    return fields
+
+
+def price_display(value):
+    if not isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, float) and not value.is_integer():
+        return f"{value:g}"
+    return f"{int(value):,}".replace(",", " ")
+
+
+def set_price_value(config, path, value):
+    parts = path.split(":")
+    if parts == ["currency"]:
+        config["currency"] = value
+    elif len(parts) == 2 and parts[0] == "range" and parts[1] in ("0", "1"):
+        config["range"][int(parts[1])] = value
+    elif len(parts) == 2 and parts[0] == "base" and parts[1] in config["base"]:
+        config["base"][parts[1]] = value
+    elif (len(parts) == 3 and parts[0] == "rule" and parts[1].isdigit()
+          and 0 <= int(parts[1]) < len(config["rules"])
+          and parts[2] in ("add", "per_item")
+          and parts[2] in config["rules"][int(parts[1])]):
+        config["rules"][int(parts[1])][parts[2]] = value
+    else:
+        raise ValueError("Выбранное поле цен больше не существует.")
+
+
+async def show_prices(msg: Message, s):
+    try:
+        config = load_prices()
+        fields = price_fields(config)
+    except ValueError as exc:
+        log.exception("Не удалось открыть редактор цен")
+        await render(msg, s, f"⚠️ {exc}", InlineKeyboardMarkup(inline_keyboard=[
+            btn("🔧 К панели управления", "adm:home")]))
+        return
+
+    text = "💰 Редактирование цен\n\nНажмите на значение, которое хотите изменить."
+    buttons = [
+        InlineKeyboardButton(
+            text=f"{field['label'][:42]}: {price_display(field['value'])}"[:64],
+            callback_data=f"adm:priceedit:{field['path']}",
+        )
+        for field in fields
+    ]
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(text="🔧 К панели управления", callback_data="adm:home")])
+    await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
 async def open_admin(m: Message, s):
     await remove_menu_editor_keyboard(m, s)
     s["ask"] = None
     s["ld_ask"] = False
     s["role_add"] = None
+    s["price_edit"] = None
     s["menu_edit"] = None
     await clear_menu_hint(m, s)
     text, markup = admin_home()
@@ -850,6 +964,7 @@ async def cb_admin(cb: CallbackQuery):
     groups = list(GROUPS)
     s["adm_edit"] = None
     s["role_add"] = None
+    s["price_edit"] = None
     if act == "section":
         await cb.answer()
         return
@@ -909,6 +1024,36 @@ async def cb_admin(cb: CallbackQuery):
         editor.pop("pending_label", None)
         editor.pop("routes", None)
         await show_menu_editor(cb.message, s)
+        await cb.answer()
+        return
+    elif act == "prices":
+        await clear_menu_hint(cb.message, s)
+        await show_prices(cb.message, s)
+        await cb.answer()
+        return
+    elif act == "priceedit":
+        try:
+            config = load_prices()
+            field = next((item for item in price_fields(config) if item["path"] == arg), None)
+            if field is None:
+                raise ValueError("Это поле цен больше не существует.")
+        except ValueError as exc:
+            await cb.answer(str(exc), show_alert=True)
+            await show_prices(cb.message, s)
+            return
+        s["price_edit"] = {"path": arg}
+        prompt_text = ("Отправьте новое значение валюты." if field["kind"] == "text"
+                       else f"Отправьте новое значение для «{field['label']}».\n"
+                            + ("Допустима десятичная дробь, например 0.85." if field["kind"] == "ratio"
+                               else "Введите целое число без разделителей."))
+        await send_menu_hint(cb.message, s, prompt_text, InlineKeyboardMarkup(inline_keyboard=[
+            btn("Отмена", "adm:pricecancel")]))
+        await cb.answer()
+        return
+    elif act == "pricecancel":
+        s["price_edit"] = None
+        await clear_menu_hint(cb.message, s)
+        await show_prices(cb.message, s)
         await cb.answer()
         return
     elif act == "resetall":
@@ -1440,6 +1585,58 @@ async def on_message(m: Message):
         if action:
             await handle_menu_editor_keyboard(m, s, action)
             return
+
+    price_edit = s.get("price_edit")
+    if price_edit and is_admin(m.from_user.id):
+        if not m.text or not m.text.strip():
+            await try_delete(m)
+            await send_menu_hint(m, s, "Отправьте новое значение текстом.", InlineKeyboardMarkup(
+                inline_keyboard=[btn("Отмена", "adm:pricecancel")]))
+            return
+        try:
+            config = load_prices()
+            field = next((item for item in price_fields(config)
+                          if item["path"] == price_edit["path"]), None)
+            if field is None:
+                raise ValueError("Это поле цен больше не существует.")
+            value_text = m.text.strip()
+            if field["kind"] == "text":
+                if len(value_text) > 12 or "\n" in value_text:
+                    raise ValueError("Название валюты должно содержать от 1 до 12 символов.")
+                value = value_text
+            else:
+                value = float(value_text.replace(",", "."))
+                if not math.isfinite(value):
+                    raise ValueError("Введите конечное число.")
+                if field["kind"] == "ratio":
+                    if value <= 0:
+                        raise ValueError("Коэффициент должен быть больше нуля.")
+                    range_index = int(field["path"].split(":")[1])
+                    other_value = config["range"][1 - range_index]
+                    if (range_index == 0 and value > other_value) or (range_index == 1 and value < other_value):
+                        raise ValueError("Нижний коэффициент не может быть больше верхнего.")
+                else:
+                    if value < 0 or not value.is_integer():
+                        raise ValueError("Цена должна быть целым неотрицательным числом.")
+                    value = int(value)
+            set_price_value(config, price_edit["path"], value)
+            save_json(PRICES_FILE, config)
+        except ValueError as exc:
+            await try_delete(m)
+            await send_menu_hint(m, s, f"⚠️ {exc}\nПопробуйте ещё раз.", InlineKeyboardMarkup(
+                inline_keyboard=[btn("Отмена", "adm:pricecancel")]))
+            return
+        except OSError:
+            log.exception("Не удалось сохранить prices.json")
+            await try_delete(m)
+            await send_menu_hint(m, s, "⚠️ Не удалось сохранить prices.json. Проверьте доступ к файлу.",
+                                 InlineKeyboardMarkup(inline_keyboard=[btn("Отмена", "adm:pricecancel")]))
+            return
+        s["price_edit"] = None
+        await try_delete(m)
+        await clear_menu_hint(m, s)
+        await show_prices(m, s)
+        return
 
     if not is_admin(m.from_user.id):
         current_step = STEPS.get(s["stack"][-1]) if s["stack"] else None
