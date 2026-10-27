@@ -15,8 +15,8 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (BufferedInputFile, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery,
-                           FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands,
-                           Message, ReplyKeyboardRemove)
+                           FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+                           MenuButtonCommands, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 from dotenv import load_dotenv
 
 from scenario import BACK, GROUPS, STEPS
@@ -111,7 +111,21 @@ async def clear_kb(m: Message):
     """Убираем старую нижнюю клавиатуру (если осталась с прошлой версии бота)."""
     carrier = await m.bot.send_message(m.chat.id, "\u2063", reply_markup=ReplyKeyboardRemove(),
                                        disable_notification=True)
-    await try_delete(carrier)
+    asyncio.create_task(delete_keyboard_carrier(m.bot, m.chat.id, carrier.message_id))
+
+
+async def delete_keyboard_carrier(bot: Bot, chat_id, message_id):
+    await asyncio.sleep(2)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except TelegramBadRequest:
+        log.debug("Не удалось удалить временное сообщение клавиатуры")
+
+
+async def remove_menu_editor_keyboard(msg: Message, s):
+    if not s.pop("editor_keyboard_message", None):
+        return
+    await clear_kb(msg)
 
 
 # ───────────────────────── Заявки: хранилище ─────────────────────────
@@ -304,8 +318,9 @@ def track_chat_message(s, message_id, chat_id):
         save_json(SETTINGS_FILE, settings)
 
 
-async def clear_chat(msg: Message, s):
-    await try_delete(msg)
+async def clear_chat(msg: Message, s, preserve_current=False):
+    if not preserve_current:
+        await try_delete(msg)
     cleanup = settings.get("chat_cleanup", {})
     chat_key = str(msg.chat.id)
     persisted_ids = cleanup.get(chat_key, []) if isinstance(cleanup, dict) else []
@@ -332,6 +347,8 @@ async def clear_chat(msg: Message, s):
     if isinstance(cleanup, dict):
         cleanup.pop(chat_key, None)
         save_json(SETTINGS_FILE, settings)
+    if s.get("editor_keyboard_message"):
+        await remove_menu_editor_keyboard(msg, s)
 
 
 async def show_privacy(msg: Message, s):
@@ -538,14 +555,15 @@ async def submit_lead(bot: Bot, s):
 @router.message(CommandStart())
 async def cmd_start(m: Message):
     s = sess(m.from_user)
-    await clear_chat(m, s)
+    await clear_chat(m, s, preserve_current=True)
     if not privacy_confirmed(m.from_user.id):
         s.update(stack=[], ans={}, files=[], ask=None, submitted=False)
         await show_privacy(m, s)
+        await try_delete(m)
         return
     s.update(stack=[], ans={}, files=[], ask=None, submitted=False)
     await go(m, s, "main")
-    await clear_kb(m)
+    await try_delete(m)
 
 
 @router.message(Command("menu"))
@@ -597,6 +615,7 @@ def admin_home():
 
 
 async def open_admin(m: Message, s):
+    await remove_menu_editor_keyboard(m, s)
     s["ask"] = None
     s["ld_ask"] = False
     s["role_add"] = None
@@ -618,33 +637,127 @@ async def show_menu_editor(msg: Message, s, notice=""):
         await send_menu_hint(msg, s, notice)
     text = f"🛠 Редактор меню · {step['title']}\n\n{text}"
 
-    rows = [[InlineKeyboardButton(text="— ПУНКТЫ ТЕКУЩЕГО МЕНЮ —", callback_data="adm:section")]]
+    rows = []
     for option in effective_options(step, include_hidden=True):
         label = f"🙈 {option['label']}" if option["_hidden"] else option["label"]
         rows.append(btn(label[:60], f"adm:menuitem:{option['_menu_key']}"))
-    rows.extend([
-        [InlineKeyboardButton(text="— ДЕЙСТВИЯ РЕДАКТОРА —", callback_data="adm:section")],
-        [InlineKeyboardButton(text="🧭 Открыть подменю", callback_data="adm:menumode:open"),
-         InlineKeyboardButton(text="✏️ Текст вопроса", callback_data="adm:menumode:text")],
-        [InlineKeyboardButton(text="✏️ Изменить пункт", callback_data="adm:menumode:edit"),
-         InlineKeyboardButton(text="👁 Скрыть / показать", callback_data="adm:menumode:hide")],
-    ])
+    await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    await show_menu_editor_keyboard(msg, s, step)
+
+
+async def show_menu_editor_keyboard(msg: Message, s, step):
+    rows = [
+        [KeyboardButton(text="🧭 Открыть подменю"), KeyboardButton(text="💬 Текст вопроса")],
+        [KeyboardButton(text="✏️ Изменить пункт"), KeyboardButton(text="👁 Скрыть / показать")],
+    ]
     if allows_added_choices(step):
-        rows.append([InlineKeyboardButton(text="🗑 Удалить пункт", callback_data="adm:menumode:delete"),
-                     InlineKeyboardButton(text="➕ Добавить пункт", callback_data="adm:menumode:add")])
+        rows.append([KeyboardButton(text="🗑 Удалить пункт"), KeyboardButton(text="➕ Добавить пункт")])
     else:
-        rows.append([InlineKeyboardButton(text="🗑 Удалить пункт", callback_data="adm:menumode:delete")])
+        rows.append([KeyboardButton(text="🗑 Удалить пункт")])
     next_step = step.get("next")
     if isinstance(next_step, str) and next_step in STEPS:
-        rows.append([InlineKeyboardButton(text="➡️ Следующий вопрос", callback_data="adm:menunext")])
+        rows.append([KeyboardButton(text="➡️ Следующий вопрос")])
     rows.extend([
-        [InlineKeyboardButton(text="— НАВИГАЦИЯ И СБРОС —", callback_data="adm:section")],
-        [InlineKeyboardButton(text="↩️ Вернуть меню к стандартному виду", callback_data="adm:menureset")],
-        [InlineKeyboardButton(text="◀️ Предыдущий пункт", callback_data="adm:menuprev"),
-         InlineKeyboardButton(text="🏠 Вернуться к стартовому меню", callback_data="adm:menustart")],
-        [InlineKeyboardButton(text="🔧 К панели", callback_data="adm:home")],
+        [KeyboardButton(text="↩️ Вернуть меню к стандартному виду")],
+        [KeyboardButton(text="◀️ Предыдущий пункт"), KeyboardButton(text="🏠 В начало")],
+        [KeyboardButton(text="🔧 К панели управления")],
     ])
-    await render(msg, s, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    old_message_id = s.get("editor_keyboard_message")
+    keyboard_message = await msg.bot.send_message(
+        msg.chat.id,
+        "\u2063",
+        reply_markup=ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True),
+    )
+    s["editor_keyboard_message"] = keyboard_message.message_id
+    asyncio.create_task(delete_keyboard_carrier(msg.bot, msg.chat.id, keyboard_message.message_id))
+    if old_message_id:
+        try:
+            await msg.bot.delete_message(msg.chat.id, old_message_id)
+        except TelegramBadRequest:
+            log.debug("Не удалось удалить предыдущее сообщение управления редактором")
+
+
+async def handle_menu_editor_keyboard(m: Message, s, action):
+    editor = s.get("menu_edit")
+    if not editor:
+        return
+    await try_delete(m)
+    if action.startswith("menumode:"):
+        mode = action.split(":", 1)[1]
+        step = STEPS[editor["stack"][-1]]
+        if mode == "add" and not allows_added_choices(step):
+            await send_menu_hint(m, s, "Добавлять пункты можно только в выборах, которые записываются в заявку.")
+            return
+        if mode == "text":
+            editor["pending"] = "step_text"
+            await send_menu_hint(m, s, "Отправьте новый текст для этого пункта меню.")
+            return
+        if mode == "add":
+            editor["pending"] = "add_label"
+            await send_menu_hint(m, s, "Отправьте текст нового пункта меню.")
+            return
+        editor["action"] = mode
+        labels = {
+            "open": "Выберите пункт, чтобы открыть его следующее меню.",
+            "edit": "Выберите пункт, текст которого нужно изменить.",
+            "hide": "Выберите пункт, который нужно скрыть или показать.",
+            "delete": "Выберите пункт, который нужно удалить.",
+        }
+        await show_menu_editor(m, s, labels.get(mode, "Выберите пункт меню."))
+        return
+
+    await clear_menu_hint(m, s)
+    if action == "menunext":
+        step = STEPS[editor["stack"][-1]]
+        next_step = step.get("next")
+        if isinstance(next_step, str) and next_step in STEPS:
+            push(editor, next_step)
+            editor["action"] = "open"
+            editor.pop("pending", None)
+            await show_menu_editor(m, s)
+        return
+    if action == "menuprev":
+        editor.pop("pending", None)
+        editor.pop("choice_key", None)
+        editor.pop("pending_label", None)
+        editor.pop("routes", None)
+        if len(editor["stack"]) > 1:
+            editor["stack"].pop()
+            editor["action"] = "open"
+            await show_menu_editor(m, s)
+        else:
+            await send_menu_hint(m, s, "Вы уже в первом меню.")
+        return
+    if action == "menustart":
+        editor["stack"] = ["main"]
+        editor["action"] = "open"
+        editor.pop("pending", None)
+        editor.pop("choice_key", None)
+        editor.pop("pending_label", None)
+        editor.pop("routes", None)
+        await show_menu_editor(m, s)
+        return
+    if action == "menureset":
+        sid = editor["stack"][-1]
+        overrides.pop(sid, None)
+        settings.get("menu_choices", {}).pop(sid, None)
+        if not settings.get("menu_choices"):
+            settings.pop("menu_choices", None)
+        save_json(OVERRIDES_FILE, overrides)
+        save_json(SETTINGS_FILE, settings)
+        editor["action"] = "open"
+        editor.pop("pending", None)
+        editor.pop("choice_key", None)
+        editor.pop("pending_label", None)
+        editor.pop("routes", None)
+        await show_menu_editor(m, s)
+        await send_menu_hint(m, s, "✅ Этот экран и его пункты возвращены к стандартному виду.")
+        return
+    if action == "home":
+        s["menu_edit"] = None
+        await remove_menu_editor_keyboard(m, s)
+        text, markup = admin_home()
+        await render(m, s, text, markup)
 
 
 def save_menu_choices():
@@ -690,15 +803,19 @@ async def cmd_setmanager(m: Message):
 @router.message(Command("contacts"))
 async def cmd_contacts(m: Message):
     s = sess(m.from_user)
-    if not await require_privacy(m, s):
+    await clear_chat(m, s, preserve_current=True)
+    if not privacy_confirmed(m.from_user.id):
+        s.update(stack=[], ans={}, files=[], ask=None, submitted=False)
+        await show_privacy(m, s)
+        await try_delete(m)
         return
-    await clear_chat(m, s)
     s["ask"] = None
     s["role_add"] = None
     s["menu_edit"] = None
     if not s["stack"]:
         s["stack"] = ["main"]
     await go(m, s, "contacts")
+    await try_delete(m)
 
 
 @router.message(Command("leads"))
@@ -855,6 +972,7 @@ async def cb_admin(cb: CallbackQuery):
         else:
             await clear_menu_hint(cb.message, s)
             s["menu_edit"] = None
+            await remove_menu_editor_keyboard(cb.message, s)
             text, markup = admin_home()
             await render(cb.message, s, text, markup)
         await cb.answer()
@@ -1004,6 +1122,7 @@ async def cb_admin(cb: CallbackQuery):
     if act == "home":
         await clear_menu_hint(cb.message, s)
         s["menu_edit"] = None
+        await remove_menu_editor_keyboard(cb.message, s)
         text, markup = admin_home()
     elif act == "groups":
         text = "Выберите раздел сценария:"
@@ -1302,13 +1421,32 @@ async def on_message(m: Message):
         await show_privacy(m, s)
         return
 
+    editor = s.get("menu_edit")
+    if editor and is_admin(m.from_user.id) and m.text:
+        editor_actions = {
+            "🧭 Открыть подменю": "menumode:open",
+            "💬 Текст вопроса": "menumode:text",
+            "✏️ Изменить пункт": "menumode:edit",
+            "👁 Скрыть / показать": "menumode:hide",
+            "🗑 Удалить пункт": "menumode:delete",
+            "➕ Добавить пункт": "menumode:add",
+            "➡️ Следующий вопрос": "menunext",
+            "↩️ Вернуть меню к стандартному виду": "menureset",
+            "◀️ Предыдущий пункт": "menuprev",
+            "🏠 В начало": "menustart",
+            "🔧 К панели управления": "home",
+        }
+        action = editor_actions.get(m.text.strip())
+        if action:
+            await handle_menu_editor_keyboard(m, s, action)
+            return
+
     if not is_admin(m.from_user.id):
         current_step = STEPS.get(s["stack"][-1]) if s["stack"] else None
         if not s.get("ask") and not (current_step and current_step.get("accept_text")):
             await try_delete(m)
             return
 
-    editor = s.get("menu_edit")
     if editor and is_admin(m.from_user.id) and editor.get("pending") == "route":
         await try_delete(m)
         return
